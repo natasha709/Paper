@@ -97,6 +97,11 @@ function initLoginFeatureBackground() {
   }
 }
 
+function saveCurrentUser() {
+  localStorage.setItem(USER_KEY, JSON.stringify(currentUser, (key, value) =>
+    key === 'plainTextNotice' ? undefined : value));
+}
+
 // Refresh user permissions
 async function refreshCurrentUser() {
   if (!currentToken) return;
@@ -106,7 +111,7 @@ async function refreshCurrentUser() {
   if (res.ok) {
     const data = await res.json();
     currentUser = data.user;
-    localStorage.setItem(USER_KEY, JSON.stringify(currentUser));
+    saveCurrentUser();
   } else {
     throw new Error('Session expired');
   }
@@ -182,7 +187,7 @@ function toggleSidebarSection(navId) {
 // Switch between Main Tabs (Papers Repository, Admin Dashboard, Administration)
 function showDashboardTab(tabName) {
   const isAdminUser = !!currentUser && currentUser.role === 'admin';
-  if ((tabName === 'admin' || tabName === 'dashboard') && !isAdminUser) {
+  if ((tabName === 'admin' || tabName === 'dashboard' || tabName === 'deletion-requests') && !isAdminUser) {
     tabName = 'papers';
   }
   activeDashboardTab = tabName;
@@ -191,13 +196,16 @@ function showDashboardTab(tabName) {
   const papersView = document.getElementById('papersMainView');
   const adminView = document.getElementById('adminMainView');
   const dashboardView = document.getElementById('dashboardMainView');
+  const deletionRequestsView = document.getElementById('deletionRequestsMainView');
   const navAdminTab = document.getElementById('navAdminTab');
   const navDashboardTab = document.getElementById('navDashboardTab');
+  const navDeletionRequestsTab = document.getElementById('navDeletionRequestsTab');
 
-  [[papersView, 'papers'], [dashboardView, 'dashboard'], [adminView, 'admin']].forEach(([view, name]) => {
+  [[papersView, 'papers'], [dashboardView, 'dashboard'], [adminView, 'admin'], [deletionRequestsView, 'deletion-requests']].forEach(([view, name]) => {
     if (view) view.classList.toggle('hidden', name !== tabName);
   });
 
+  // Handle sidebar active states
   if (navAdminTab) {
     navAdminTab.classList.toggle('ring-2', tabName === 'admin');
     navAdminTab.classList.toggle('ring-white/40', tabName === 'admin');
@@ -205,6 +213,10 @@ function showDashboardTab(tabName) {
   if (navDashboardTab) {
     navDashboardTab.classList.toggle('ring-2', tabName === 'dashboard');
     navDashboardTab.classList.toggle('ring-white/40', tabName === 'dashboard');
+  }
+  if (navDeletionRequestsTab) {
+    navDeletionRequestsTab.classList.toggle('ring-2', tabName === 'deletion-requests');
+    navDeletionRequestsTab.classList.toggle('ring-white/40', tabName === 'deletion-requests');
   }
 
   if (tabName === 'papers') {
@@ -218,6 +230,8 @@ function showDashboardTab(tabName) {
     loadAdminTeachersTable();
   } else if (tabName === 'dashboard') {
     loadAdminDashboard();
+  } else if (tabName === 'deletion-requests') {
+    loadAdminDeletionRequests();
   } else {
     updateBreadcrumbTitle();
     fetchPapers();
@@ -286,7 +300,7 @@ async function handleLogin(e) {
     currentToken = data.token;
     currentUser = data.user;
     localStorage.setItem(TOKEN_KEY, currentToken);
-    localStorage.setItem(USER_KEY, JSON.stringify(currentUser));
+    saveCurrentUser();
 
     const remember = document.getElementById('loginRemember');
     if (remember && remember.checked) {
@@ -553,7 +567,7 @@ async function handleUpdateProfileSubmit(e) {
     if (!res.ok) throw new Error(data.error || 'Could not update profile');
 
     currentUser.name = data.user.name;
-    localStorage.setItem(USER_KEY, JSON.stringify(currentUser));
+    saveCurrentUser();
     updateUserDisplay();
     successBox.classList.remove('hidden');
     showToast('Profile updated successfully', 'success');
@@ -624,7 +638,7 @@ async function handleChangePasswordSubmit(e) {
     if (!res.ok) throw new Error(data.error || 'Could not update password');
 
     currentUser.plainTextNotice = newInput.value.trim();
-    localStorage.setItem(USER_KEY, JSON.stringify(currentUser));
+    saveCurrentUser();
 
     document.getElementById('changePasswordForm').reset();
     accountPasswordVisible = false;
@@ -677,6 +691,7 @@ function showAppView() {
   if (isAdmin) {
     adminSection.classList.remove('hidden');
     loadAdminStats();
+    loadAdminDeletionRequests();
   } else {
     adminSection.classList.add('hidden');
   }
@@ -873,6 +888,162 @@ function renderAdminDashboard(stats) {
         }
       }
     });
+  }
+}
+
+// ==================== ADMIN: DELETION REQUESTS ====================
+
+async function loadAdminDeletionRequests() {
+  if (!currentUser || currentUser.role !== 'admin') return;
+  
+  try {
+    const res = await fetch(`${API_BASE}/admin/deletion-requests`, {
+      headers: { 'Authorization': `Bearer ${currentToken}` }
+    });
+    
+    if (!res.ok) throw new Error('Failed to load deletion requests');
+    
+    const data = await res.json();
+    const requests = data.requests || [];
+    
+    // Update badge in sidebar
+    const pendingCount = requests.filter(r => r.status === 'pending').length;
+    const sidebarBadge = document.getElementById('sideBadgeDeletionRequestsCount');
+    if (sidebarBadge) {
+      sidebarBadge.textContent = `${pendingCount}`;
+      sidebarBadge.classList.toggle('hidden', pendingCount === 0);
+    }
+    
+    // Update badge in page (deletion requests page has its own badge)
+    const badge = document.getElementById('adminDeletionRequestsCount');
+    if (badge) badge.textContent = `${pendingCount} pending`;
+
+    const tbody = document.getElementById('adminDeletionRequestsTableBody');
+    if (!tbody) return;
+    
+    if (requests.length === 0) {
+      tbody.innerHTML = `
+        <tr>
+          <td colspan="6" class="px-5 py-10 text-center text-slate-400">
+            No deletion requests
+          </td>
+        </tr>
+      `;
+      if (window.lucide) lucide.createIcons();
+      return;
+    }
+    
+    tbody.innerHTML = requests.map(r => {
+      const paperTitle = escapeHtml(r.paperTitle || 'Unknown paper');
+      const paperSubject = escapeHtml(r.paperSubject || '—');
+      const teacherName = escapeHtml(r.requestedByName || r.requestedByUsername);
+      const submittedAt = r.createdAt ? new Date(r.createdAt).toLocaleString() : 'N/A';
+      
+      let statusBadge = '';
+      if (r.status === 'pending') {
+        statusBadge = '<span class="px-2.5 py-1 rounded-full text-xs font-bold bg-amber-100 text-amber-800 border border-amber-200 flex items-center gap-1 w-max"><i data-lucide="clock" class="w-3.5 h-3.5"></i> Pending</span>';
+      } else if (r.status === 'approved') {
+        statusBadge = '<span class="px-2.5 py-1 rounded-full text-xs font-bold bg-green-100 text-green-800 border border-green-200 flex items-center gap-1 w-max"><i data-lucide="check" class="w-3.5 h-3.5"></i> Approved</span>';
+      } else if (r.status === 'rejected') {
+        statusBadge = '<span class="px-2.5 py-1 rounded-full text-xs font-bold bg-red-100 text-red-800 border border-red-200 flex items-center gap-1 w-max"><i data-lucide="x" class="w-3.5 h-3.5"></i> Rejected</span>';
+      }
+      
+      const reasonHtml = r.reason ? `<span class="text-slate-700 italic">"${escapeHtml(r.reason)}"</span>` : '<span class="text-slate-400 italic">No reason provided</span>';
+      
+      return `
+        <tr class="hover:bg-slate-50 transition">
+          <td class="px-5 py-4">
+            <div class="flex items-start gap-2">
+              <i data-lucide="file-text" class="w-4 h-4 shrink-0 text-school-700 mt-0.5"></i>
+              <div>
+                <div class="font-bold text-slate-900 text-sm">${paperTitle}</div>
+                <div class="text-[11px] text-slate-500">${paperSubject}</div>
+              </div>
+            </div>
+          </td>
+          <td class="px-5 py-4">
+            <div class="font-medium text-slate-800">${teacherName}</div>
+            <div class="text-[11px] text-slate-500">${escapeHtml(r.requestedByUsername)}</div>
+          </td>
+          <td class="px-5 py-4 text-xs text-slate-600">
+            <div>${submittedAt}</div>
+          </td>
+          <td class="px-5 py-4">
+            ${reasonHtml}
+          </td>
+          <td class="px-5 py-4 text-center">
+            ${statusBadge}
+          </td>
+          <td class="px-5 py-4 text-right whitespace-nowrap space-x-2">
+            ${r.status === 'pending' ? `
+              <button
+                onclick="handleApproveDeletionRequest('${r.id}', '${r.paperId}')"
+                class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-green-600 hover:bg-green-700 text-white transition inline-flex items-center gap-1"
+                title="Approve deletion"
+              >
+                <i data-lucide="check" class="w-3.5 h-3.5"></i>
+                Approve
+              </button>
+              <button
+                onclick="handleRejectDeletionRequest('${r.id}', '${r.paperId}')"
+                class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-600 hover:bg-red-700 text-white transition inline-flex items-center gap-1"
+                title="Reject deletion"
+              >
+                <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                Reject
+              </button>
+            ` : ''}
+          </td>
+        </tr>
+      `;
+    }).join('');
+    
+    if (window.lucide) lucide.createIcons();
+  } catch (err) {
+    console.error('Error loading deletion requests:', err);
+  }
+}
+
+async function handleApproveDeletionRequest(requestId, paperId) {
+  if (!confirm('Approve this deletion? The paper will be permanently removed.')) return;
+  
+  try {
+    const res = await fetch(`${API_BASE}/admin/deletion-requests/${requestId}/approve`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${currentToken}` }
+    });
+    
+    if (!res.ok) throw new Error('Failed to approve deletion');
+    
+    showToast('Deletion approved and paper removed', 'success');
+    loadAdminDeletionRequests();
+    fetchPapers();
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
+
+async function handleRejectDeletionRequest(requestId, paperId) {
+  const reason = prompt('Please provide a reason for rejection (optional):');
+  if (reason === null) return;
+  
+  try {
+    const res = await fetch(`${API_BASE}/admin/deletion-requests/${requestId}/reject`, {
+      method: 'POST',
+      headers: { 
+        'Authorization': `Bearer ${currentToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ reason: reason || '' })
+    });
+    
+    if (!res.ok) throw new Error('Failed to reject deletion');
+    
+    showToast('Deletion request rejected', 'success');
+    loadAdminDeletionRequests();
+    fetchPapers();
+  } catch (err) {
+    showToast(err.message, 'error');
   }
 }
 
@@ -1255,6 +1426,12 @@ async function fetchPapers() {
     const data = await res.json();
     if (fetchId !== papersFetchId) return;
     papersList = data.papers || [];
+    
+    // Filter out approved/deleted papers from teacher view
+    if (currentUser && currentUser.role === 'teacher') {
+      papersList = papersList.filter(p => p.deletionStatus !== 'approved');
+    }
+    
     resultsCount.textContent = papersList.length;
 
     if (papersList.length === 0) {
@@ -1298,8 +1475,20 @@ function renderGridView(papers) {
           ? (p.paperType || 'Exam').slice(0, 8) + '…'
           : (p.paperType || 'Exam');
 
+        const teacherPending = !!currentUser && currentUser.role === 'teacher' && p.deletionStatus === 'pending';
+        const inactiveClass = teacherPending ? ' opacity-40 cursor-not-allowed pointer-events-none' : '';
+        
+        // Deletion status indicator
+        let statusIndicator = '';
+        if (p.deletionStatus === 'pending') {
+          statusIndicator = '<div class="absolute top-1 right-1 z-10 w-2 h-2 rounded-full bg-amber-500 animate-pulse" title="Deletion pending approval"></div>';
+        } else if (p.deletionStatus === 'approved') {
+          statusIndicator = '<div class="absolute top-1 right-1 z-10 w-2 h-2 rounded-full bg-red-500" title="Paper deleted"></div>';
+        }
+
         return `
-          <div class="paper-card bg-white rounded border border-slate-200 hover:border-school-400 shadow-sm flex flex-col justify-between overflow-hidden text-xs">
+          <div class="${p.deletionStatus === 'approved' ? 'opacity-50' : ''} paper-card bg-white rounded border border-slate-200 hover:border-school-400 shadow-sm flex flex-col justify-between overflow-hidden text-xs relative">
+            ${statusIndicator}
             <div class="p-1.5 flex-1">
               <div class="flex items-center justify-between gap-0.5 mb-1 flex-wrap">
                 <div class="flex items-center gap-0.5">
@@ -1338,28 +1527,31 @@ function renderGridView(papers) {
               <div class="flex items-center gap-0.5">
                 <button 
                   onclick="openPreviewModal('${p.id}')"
-                  title="View"
+                  title="${teacherPending ? 'Deletion pending approval' : 'View'}"
                   aria-label="View paper"
-                  class="p-0.5 text-school-700 hover:text-school-900 hover:bg-school-50 rounded transition"
+                  ${teacherPending ? 'disabled' : ''}
+                  class="p-0.5 text-school-700 hover:text-school-900 hover:bg-school-50 rounded transition${inactiveClass}"
                 >
                   <i data-lucide="eye" class="w-2.5 h-2.5"></i>
                 </button>
 
                 <button 
                   onclick="downloadPaper('${p.id}', '${escapeHtml(p.originalName)}')"
-                  title="Download"
+                  title="${teacherPending ? 'Deletion pending approval' : 'Download'}"
                   aria-label="Download paper"
-                  class="p-0.5 text-school-700 hover:text-school-900 bg-school-100 hover:bg-school-200 rounded transition active:scale-95"
+                  ${teacherPending ? 'disabled' : ''}
+                  class="p-0.5 text-school-700 hover:text-school-900 bg-school-100 hover:bg-school-200 rounded transition active:scale-95${inactiveClass}"
                 >
                   <i data-lucide="download" class="w-2.5 h-2.5"></i>
                 </button>
 
-                ${canDelete ? `
+                ${canDelete && p.deletionStatus !== 'approved' ? `
                   <button 
                     onclick="openDeletePaperModal('${p.id}')"
-                    title="Delete"
+                    title="${teacherPending ? 'Deletion pending approval' : 'Delete'}"
                     aria-label="Delete paper"
-                    class="p-0.5 text-red-600 hover:text-red-700 hover:bg-red-50 rounded transition"
+                    ${teacherPending ? 'disabled' : ''}
+                    class="p-0.5 text-red-600 hover:text-red-700 hover:bg-red-50 rounded transition${inactiveClass}"
                   >
                     <i data-lucide="trash-2" class="w-2.5 h-2.5"></i>
                   </button>
@@ -1390,6 +1582,7 @@ function renderTableView(papers) {
               <th class="w-[6.5rem] px-2.5 py-3">Subject</th>
               <th class="hidden w-[7.5rem] px-2.5 py-3 sm:table-cell">Year / Term</th>
               <th class="hidden w-[7.5rem] px-2.5 py-3 lg:table-cell">Category</th>
+              <th class="w-[5rem] px-2.5 py-3 text-center">Status</th>
               <th class="w-[7.5rem] px-2.5 py-3 text-right">Actions</th>
             </tr>
           </thead>
@@ -1398,9 +1591,21 @@ function renderTableView(papers) {
               const isBio = p.subject === 'Biology';
               const badgeClass = isBio ? 'badge-biology' : 'badge-chemistry';
               const fileExt = getFileExtension(p.originalName);
+              const teacherPending = !!currentUser && currentUser.role === 'teacher' && p.deletionStatus === 'pending';
+              const inactiveClass = teacherPending ? ' opacity-40 cursor-not-allowed pointer-events-none' : '';
+              
+              // Deletion status badge
+              let statusBadge = '';
+              if (p.deletionStatus === 'pending') {
+                statusBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200 animate-pulse">Pending</span>';
+              } else if (p.deletionStatus === 'approved') {
+                statusBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-red-100 text-red-800 border border-red-200">Deleted</span>';
+              } else if (p.deletionStatus === 'rejected') {
+                statusBadge = '<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-200 text-slate-600 border border-slate-300">Rejected</span>';
+              }
 
               return `
-                <tr class="hover:bg-slate-50 transition">
+                <tr class="${p.deletionStatus === 'approved' ? 'opacity-50' : ''} hover:bg-slate-50 transition">
                   <td class="px-2.5 py-2.5">
                     <div class="flex min-w-0 items-center gap-2">
                       <i data-lucide="file-text" class="w-4 h-4 shrink-0 text-school-700"></i>
@@ -1428,32 +1633,38 @@ function renderTableView(papers) {
                   <td class="hidden px-2.5 py-2.5 text-xs text-slate-500 lg:table-cell">
                     <span class="block truncate" title="${escapeHtml(p.paperType || '')}">${escapeHtml(p.paperType || '')}</span>
                   </td>
+                  <td class="px-2.5 py-2.5 whitespace-nowrap text-center">
+                    ${statusBadge}
+                  </td>
                   <td class="px-2.5 py-2.5 whitespace-nowrap text-right">
                     <div class="inline-flex items-center gap-1">
                     <button 
                       onclick="openPreviewModal('${p.id}')"
-                      class="p-1.5 text-school-700 hover:text-school-900 bg-white hover:bg-school-50 border border-school-300 rounded transition"
-                      title="View"
+                      class="p-1.5 text-school-700 hover:text-school-900 bg-white hover:bg-school-50 border border-school-300 rounded transition${inactiveClass}"
+                      title="${teacherPending ? 'Deletion pending approval' : 'View'}"
                       aria-label="View paper"
+                      ${teacherPending ? 'disabled' : ''}
                     >
                       <i data-lucide="eye" class="w-4 h-4"></i>
                     </button>
 
                     <button 
                       onclick="downloadPaper('${p.id}', '${escapeHtml(p.originalName)}')"
-                      class="p-1.5 text-school-700 hover:text-school-900 bg-school-50 hover:bg-school-100 border border-school-300 rounded transition"
-                      title="Download"
+                      class="p-1.5 text-school-700 hover:text-school-900 bg-school-50 hover:bg-school-100 border border-school-300 rounded transition${inactiveClass}"
+                      title="${teacherPending ? 'Deletion pending approval' : 'Download'}"
                       aria-label="Download paper"
+                      ${teacherPending ? 'disabled' : ''}
                     >
                       <i data-lucide="download" class="w-4 h-4"></i>
                     </button>
 
-                    ${canDelete ? `
+                    ${canDelete && p.deletionStatus !== 'approved' ? `
                       <button 
                         onclick="openDeletePaperModal('${p.id}')"
-                        class="p-1.5 text-red-600 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 rounded transition"
-                        title="Delete"
+                        class="p-1.5 text-red-600 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 rounded transition${inactiveClass}"
+                        title="${teacherPending ? 'Deletion pending approval' : 'Delete'}"
                         aria-label="Delete paper"
+                        ${teacherPending ? 'disabled' : ''}
                       >
                         <i data-lucide="trash-2" class="w-4 h-4 inline"></i>
                       </button>
@@ -1616,6 +1827,10 @@ function openPreviewModal(id) {
     showToast('Paper not found', 'error');
     return;
   }
+  if (currentUser.role === 'teacher' && paper.deletionStatus === 'pending') {
+    showToast('This paper is awaiting deletion approval.', 'warning');
+    return;
+  }
 
   previewPaper = paper;
   revokePreviewUrl();
@@ -1726,6 +1941,11 @@ function downloadPreviewedPaper() {
 // ==================== DOWNLOAD & DELETE ====================
 
 async function downloadPaper(id, filename) {
+  const paper = papersList.find(p => p.id === id);
+  if (currentUser.role === 'teacher' && paper && paper.deletionStatus === 'pending') {
+    showToast('This paper is awaiting deletion approval.', 'warning');
+    return;
+  }
   try {
     showToast('Downloading paper...', 'info');
     const res = await fetch(`${API_BASE}/papers/${id}/download`, {
@@ -1754,12 +1974,40 @@ async function downloadPaper(id, filename) {
 }
 
 function openDeletePaperModal(id) {
-  pendingDeletePaperId = id;
   const paper = papersList.find(p => p.id === id);
-  const titleEl = document.getElementById('deletePaperTitle');
-  if (titleEl) {
-    titleEl.textContent = paper ? paper.title : 'Unknown paper';
+  if (!paper) return;
+
+  const isTeacher = !!currentUser && currentUser.role === 'teacher';
+  if (isTeacher && paper.deletionStatus === 'pending') {
+    showToast('A deletion request for this paper is already awaiting administrator approval.', 'warning');
+    return;
   }
+
+  pendingDeletePaperId = id;
+
+  const titleEl = document.getElementById('deletePaperTitle');
+  if (titleEl) titleEl.textContent = paper.title;
+
+  const headingEl = document.getElementById('deletePaperModalTitle');
+  const messageEl = document.getElementById('deletePaperMessage');
+  const reasonContainer = document.getElementById('deletePaperReasonContainer');
+  const reasonInput = document.getElementById('deletePaperReason');
+  const confirmTextEl = document.getElementById('deletePaperConfirmText');
+
+  if (isTeacher) {
+    if (headingEl) headingEl.textContent = 'Request paper deletion';
+    if (messageEl) messageEl.textContent = 'Please provide a reason for deletion (minimum 5 characters). An administrator will review your request.';
+    if (reasonContainer) reasonContainer.classList.remove('hidden');
+    if (reasonInput) reasonInput.value = '';
+    if (confirmTextEl) confirmTextEl.textContent = 'Request Deletion';
+  } else {
+    if (headingEl) headingEl.textContent = 'Delete paper';
+    if (messageEl) messageEl.textContent = 'This will permanently remove the file from the repository. You cannot undo this action.';
+    if (reasonContainer) reasonContainer.classList.add('hidden');
+    if (reasonInput) reasonInput.value = '';
+    if (confirmTextEl) confirmTextEl.textContent = 'Delete';
+  }
+
   const modal = document.getElementById('deletePaperModal');
   if (modal) modal.classList.remove('hidden');
   if (window.lucide) lucide.createIcons();
@@ -1775,30 +2023,63 @@ async function confirmDeletePaper() {
   const id = pendingDeletePaperId;
   if (!id) return;
 
+  const isTeacher = !!currentUser && currentUser.role === 'teacher';
+  const headers = { 'Authorization': `Bearer ${currentToken}` };
+  let body;
+
+  if (isTeacher) {
+    const reasonInput = document.getElementById('deletePaperReason');
+    const reason = reasonInput ? reasonInput.value.trim() : '';
+    if (reason.length < 5) {
+      showToast('Please enter a reason of at least 5 characters.', 'warning');
+      return;
+    }
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify({ reason });
+  }
+
   const confirmBtn = document.getElementById('deletePaperConfirmBtn');
+  const confirmTextEl = document.getElementById('deletePaperConfirmText');
+  const idleLabel = isTeacher ? 'Request Deletion' : 'Delete';
+
   if (confirmBtn) {
     confirmBtn.disabled = true;
-    confirmBtn.innerHTML = '<span>Deleting…</span>';
+    if (confirmTextEl) confirmTextEl.textContent = isTeacher ? 'Submitting…' : 'Deleting…';
   }
 
   try {
     const res = await fetch(`${API_BASE}/papers/${id}`, {
       method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${currentToken}` }
+      headers,
+      body
     });
 
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Could not delete paper');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 409) {
+        closeDeletePaperModal();
+        fetchPapers();
+      }
+      throw new Error(data.error || 'Could not delete paper');
+    }
 
     closeDeletePaperModal();
-    showToast('Paper deleted successfully', 'success');
+    showToast(
+      isTeacher ? 'Deletion request sent to the administrator.' : 'Paper deleted successfully',
+      'success'
+    );
     fetchPapers();
+    if (!isTeacher) loadAdminDeletionRequests();
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
     if (confirmBtn) {
       confirmBtn.disabled = false;
-      confirmBtn.innerHTML = '<i data-lucide="trash-2" class="w-4 h-4"></i><span>Delete</span>';
+      if (confirmTextEl) {
+        confirmTextEl.textContent = idleLabel;
+      } else {
+        confirmBtn.innerHTML = `<span>${idleLabel}</span>`;
+      }
       if (window.lucide) lucide.createIcons();
     }
   }
@@ -1835,7 +2116,6 @@ async function loadAdminTeachersTable() {
     console.log('API Response status:', res.status);
     if (!res.ok) throw new Error('Failed to load teachers');
     const data = await res.json();
-    console.log('Teachers data received:', data);
     
     teachersList = data.teachers || [];
     console.log('Number of teachers:', teachersList.length);

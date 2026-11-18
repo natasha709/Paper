@@ -21,10 +21,13 @@ const PAPERS_FILE = path.join(DATA_DIR, 'papers.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const CLASSES_FILE = path.join(DATA_DIR, 'classes.json');
 
-// Ensure directories exist
+// Ensure directories exist before writing any files into them
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 if (!fs.existsSync(PAPERS_FILE)) fs.writeFileSync(PAPERS_FILE, '[]', 'utf8');
+
+const DELETION_REQUESTS_FILE = path.join(DATA_DIR, 'deletion_requests.json');
+if (!fs.existsSync(DELETION_REQUESTS_FILE)) fs.writeFileSync(DELETION_REQUESTS_FILE, '[]', 'utf8');
 
 // Helper to hash password
 function hashPassword(password) {
@@ -593,6 +596,7 @@ app.post('/api/classes', authMiddleware, adminMiddleware, (req, res) => {
 app.get('/api/papers', authMiddleware, (req, res) => {
   const { classYear, subject, term, academicYear, search } = req.query;
   let papers = readData(PAPERS_FILE, []);
+  const deletionRequests = readData(DELETION_REQUESTS_FILE, []);
 
   // Strict Subject Scope Check:
   // If not admin, restrict papers strictly to user's assignedSubjects!
@@ -623,12 +627,22 @@ app.get('/api/papers', authMiddleware, (req, res) => {
   if (search && search.trim() !== '') {
     const q = search.trim().toLowerCase();
     papers = papers.filter(p => 
-      p.title.toLowerCase().includes(q) ||
-      p.description.toLowerCase().includes(q) ||
-      p.originalName.toLowerCase().includes(q) ||
-      p.paperType.toLowerCase().includes(q)
+      (p.title || '').toLowerCase().includes(q) ||
+      (p.description || '').toLowerCase().includes(q) ||
+      (p.originalName || '').toLowerCase().includes(q) ||
+      (p.paperType || '').toLowerCase().includes(q)
     );
   }
+
+  papers.forEach(p => {
+    const latest = deletionRequests
+      .filter(r => r.paperId === p.id)
+      .sort((a, b) => Number(b.status === 'pending') - Number(a.status === 'pending') ||
+        new Date(b.createdAt || 0) - new Date(a.createdAt || 0))[0];
+    p.deletionStatus = latest ? latest.status : null;
+    p.deletionRequestedAt = latest ? latest.createdAt : null;
+    p.deletionProcessedAt = latest ? latest.processedAt : null;
+  });
 
   // Sort latest first
   papers.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
@@ -762,6 +776,7 @@ app.get('/api/papers/:id/download', authMiddleware, (req, res) => {
 
 // Delete paper
 app.delete('/api/papers/:id', authMiddleware, (req, res) => {
+  // Teachers must request approval, admins can delete directly
   if (req.user.role !== 'teacher' && req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Permission denied. Only teachers and admins can delete papers.' });
   }
@@ -775,28 +790,163 @@ app.delete('/api/papers/:id', authMiddleware, (req, res) => {
   }
 
   const paper = papers[paperIndex];
-
   // Subject permission check
   if (req.user.role !== 'admin' && req.user.assignedSubjects && !req.user.assignedSubjects.includes(paper.subject)) {
     return res.status(403).json({ error: `Permission denied. You cannot delete ${paper.subject} papers.` });
   }
 
-  const filePath = path.join(UPLOADS_DIR, paper.filename);
-  if (fs.existsSync(filePath)) {
-    try {
-      fs.unlinkSync(filePath);
-    } catch (e) {
-      console.error('Error removing file:', e);
+  // If admin, delete immediately
+  if (req.user.role === 'admin') {
+    const filePath = path.join(UPLOADS_DIR, paper.filename);
+    if (fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (e) {
+        console.error('Error removing file:', e);
+        return res.status(500).json({ error: 'Could not remove the paper file.' });
+      }
+    }
+    papers.splice(paperIndex, 1);
+    if (!writeData(PAPERS_FILE, papers)) {
+      return res.status(500).json({ error: 'Could not update the paper list.' });
+    }
+
+    const requests = readData(DELETION_REQUESTS_FILE, []);
+    const processedAt = new Date().toISOString();
+    requests.forEach(r => {
+      if (r.paperId === paper.id && r.status === 'pending') {
+        r.status = 'approved';
+        r.processedAt = processedAt;
+        r.note = 'Paper deleted directly by an administrator.';
+      }
+    });
+    if (!writeData(DELETION_REQUESTS_FILE, requests)) {
+      return res.status(500).json({ error: 'Paper deleted, but its requests could not be updated.' });
+    }
+
+    return res.json({ message: 'Paper deleted successfully by admin' });
+  }
+
+  // Teacher: require a reason in the request body
+  const reason = req.body && typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+  if (reason.length < 5) {
+    return res.status(400).json({ error: 'A deletion reason of at least 5 characters is required.' });
+  }
+
+  // Only one pending request per paper
+  const deletionRequests = readData(DELETION_REQUESTS_FILE, []);
+  if (deletionRequests.some(r => r.paperId === paper.id && r.status === 'pending')) {
+    return res.status(409).json({ error: 'A deletion request for this paper is already awaiting administrator review.' });
+  }
+
+  // Create a deletion request entry
+  const newRequest = {
+    id: 'delreq-' + crypto.randomUUID(),
+    paperId: paper.id,
+    paperTitle: paper.title,
+    paperSubject: paper.subject,
+    requestedBy: req.user.id,
+    requestedByUsername: req.user.username,
+    requestedByName: req.user.name,
+    reason,
+    status: 'pending',
+    createdAt: new Date().toISOString()
+  };
+  deletionRequests.push(newRequest);
+  if (!writeData(DELETION_REQUESTS_FILE, deletionRequests)) {
+    return res.status(500).json({ error: 'Could not save the deletion request.' });
+  }
+
+  return res.status(202).json({ message: 'Deletion request submitted for admin approval.', requestId: newRequest.id });
+});
+  
+
+// Admin: Approve deletion request
+app.post('/api/admin/deletion-requests/:id/approve', authMiddleware, adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  let requests = readData(DELETION_REQUESTS_FILE, []);
+  const reqIdx = requests.findIndex(r => r.id === id);
+  if (reqIdx === -1) return res.status(404).json({ error: 'Deletion request not found' });
+  const delReq = requests[reqIdx];
+  if (delReq.status !== 'pending') return res.status(400).json({ error: 'Request already processed' });
+
+  const papers = readData(PAPERS_FILE, []);
+  const paperIdx = papers.findIndex(p => p.id === delReq.paperId);
+  if (paperIdx !== -1) {
+    const filePath = path.join(UPLOADS_DIR, papers[paperIdx].filename);
+    if (fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (e) {
+        console.error('Error removing file during approval:', e);
+        return res.status(500).json({ error: 'Could not remove the paper file.' });
+      }
+    }
+    papers.splice(paperIdx, 1);
+    if (!writeData(PAPERS_FILE, papers)) {
+      return res.status(500).json({ error: 'Could not update the paper list.' });
     }
   }
 
-  papers.splice(paperIndex, 1);
-  writeData(PAPERS_FILE, papers);
+  const processedAt = new Date().toISOString();
+  requests.forEach(r => {
+    if (r.paperId === delReq.paperId && r.status === 'pending') {
+      r.status = 'approved';
+      r.processedAt = processedAt;
+      if (paperIdx === -1) r.note = 'Paper was already removed before approval.';
+      else if (r.id !== delReq.id) r.note = 'Paper deleted via a related request.';
+    }
+  });
+  if (!writeData(DELETION_REQUESTS_FILE, requests)) {
+    return res.status(500).json({ error: 'Paper deleted, but its requests could not be updated.' });
+  }
 
-  res.json({ message: 'Paper deleted successfully' });
+  res.json({ message: 'Paper deleted and request approved', request: delReq });
 });
 
-// Stats endpoint
+// Admin: Reject deletion request
+app.post('/api/admin/deletion-requests/:id/reject', authMiddleware, adminMiddleware, (req, res) => {
+  const { id } = req.params;
+  let requests = readData(DELETION_REQUESTS_FILE, []);
+  const reqIdx = requests.findIndex(r => r.id === id);
+  if (reqIdx === -1) return res.status(404).json({ error: 'Deletion request not found' });
+  const delReq = requests[reqIdx];
+  if (delReq.status !== 'pending') return res.status(400).json({ error: 'Request already processed' });
+
+  delReq.status = 'rejected';
+  delReq.processedAt = new Date().toISOString();
+  delReq.rejectionReason = req.body && typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+  requests[reqIdx] = delReq;
+  if (!writeData(DELETION_REQUESTS_FILE, requests)) {
+    return res.status(500).json({ error: 'Could not save the rejection.' });
+  }
+
+  res.json({ message: 'Deletion request rejected', request: delReq });
+});
+
+// Admin: List all deletion requests (for approval page)
+app.get('/api/admin/deletion-requests', authMiddleware, adminMiddleware, (req, res) => {
+  const requests = readData(DELETION_REQUESTS_FILE, []);
+  const papers = readData(PAPERS_FILE, []);
+  const users = readData(USERS_FILE, []);
+  res.json({ requests: requests.map(r => {
+    const paper = papers.find(p => p.id === r.paperId);
+    const teacher = users.find(u => u.id === r.requestedBy);
+    return {
+      ...r,
+      paperSubject: r.paperSubject || (paper && paper.subject),
+      requestedByName: r.requestedByName || (teacher && teacher.name)
+    };
+  }) });
+});
+
+// Teacher: Get their own deletion requests
+app.get('/api/teacher/deletion-requests', authMiddleware, (req, res) => {
+  const requests = readData(DELETION_REQUESTS_FILE, []);
+  const teacherRequests = requests.filter(r => r.requestedBy === req.user.id);
+  res.json({ requests: teacherRequests });
+});
+
 app.get('/api/stats', authMiddleware, (req, res) => {
   let papers = readData(PAPERS_FILE, []);
 

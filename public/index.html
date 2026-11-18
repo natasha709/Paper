@@ -267,9 +267,21 @@
           >
             <div class="flex items-center space-x-2.5">
               <i data-lucide="shield-check" class="w-4 h-4 text-school-100 group-hover:scale-110 transition"></i>
-              <span>Administration</span>
+              <span>Teachers</span>
             </div>
             <span id="sideBadgeTeachersCount" class="text-xs bg-white/20 text-white border border-white/30 px-2 py-0.5 rounded-full font-mono font-bold">0</span>
+          </button>
+
+          <button 
+            onclick="showDashboardTab('deletion-requests')"
+            class="w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm text-left font-medium text-white/80 hover:text-white hover:bg-white/15 transition"
+            id="navDeletionRequestsTab"
+          >
+            <div class="flex items-center space-x-2.5">
+              <i data-lucide="file-warning" class="w-4 h-4 text-amber-300 group-hover:scale-110 transition"></i>
+              <span>Deletion Requests</span>
+            </div>
+            <span id="sideBadgeDeletionRequestsCount" class="text-xs bg-amber-200 text-amber-800 border border-amber-300 px-2 py-0.5 rounded-full font-mono font-bold hidden">0</span>
           </button>
         </div>
 
@@ -875,6 +887,53 @@
                 </tr>
               </thead>
               <tbody id="adminTeachersTableBody" class="divide-y divide-school-100">
+                <!-- Dynamically populated -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </main>
+
+      <!-- MAIN CONTENT VIEW 4: DELETION REQUESTS -->
+      <main id="deletionRequestsMainView" class="hidden flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto space-y-6">
+        
+        <!-- Deletion Requests Header Banner -->
+        <div class="bg-gradient-to-r from-amber-50 via-amber-100 to-amber-50 text-amber-950 p-6 rounded-2xl border border-amber-300 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div class="flex items-center space-x-3.5">
+            <div class="p-3 bg-white rounded-xl border border-amber-200 shadow-xs">
+              <i data-lucide="file-warning" class="w-8 h-8 text-amber-700"></i>
+            </div>
+            <div>
+              <h2 class="text-xl font-bold text-amber-950">Deletion Requests</h2>
+              <p class="text-xs text-amber-800 mt-0.5">Review and approve/reject deletion requests from faculty teachers.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Deletion Requests Table Card -->
+        <div class="bg-white rounded-2xl border border-amber-200 shadow-sm overflow-hidden">
+          <div class="p-4 sm:p-5 border-b border-amber-200 bg-amber-50/70 flex items-center justify-between">
+            <div class="flex items-center space-x-2">
+              <i data-lucide="file-text" class="w-5 h-5 text-amber-700"></i>
+              <h3 class="font-bold text-amber-950 text-base">All Requests</h3>
+              <span id="adminDeletionRequestsCount" class="text-xs bg-amber-200 text-amber-900 border border-amber-300 font-bold px-2.5 py-0.5 rounded-full ml-2">0 pending</span>
+            </div>
+          </div>
+
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-sm text-slate-600">
+              <thead class="bg-amber-50 text-xs uppercase font-semibold text-amber-800 border-b border-amber-200">
+                <tr>
+                  <th class="px-5 py-3.5">Paper</th>
+                  <th class="px-5 py-3.5">Teacher</th>
+                  <th class="px-5 py-3.5">Submitted</th>
+                  <th class="px-5 py-3.5">Reason</th>
+                  <th class="px-5 py-3.5 text-center">Status</th>
+                  <th class="px-5 py-3.5 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody id="adminDeletionRequestsTableBody" class="divide-y divide-amber-100">
                 <!-- Dynamically populated -->
               </tbody>
             </table>
@@ -1705,14 +1764,26 @@
       <div class="px-5 py-4 bg-red-600 text-white flex items-center justify-between">
         <div class="flex items-center space-x-2">
           <i data-lucide="trash-2" class="w-5 h-5 text-red-100"></i>
-          <h3 class="font-bold text-sm">Delete paper</h3>
+          <h3 id="deletePaperModalTitle" class="font-bold text-sm">Delete paper</h3>
         </div>
         <button type="button" onclick="closeDeletePaperModal()" class="text-red-100 hover:text-white p-1 rounded-lg">
           <i data-lucide="x" class="w-5 h-5"></i>
         </button>
       </div>
       <div class="p-5 space-y-4">
-        <p class="text-sm text-slate-600">This will permanently remove the file from the repository. You cannot undo this action.</p>
+        <p id="deletePaperMessage" class="text-sm text-slate-600">Please provide a reason for deletion (minimum 5 characters).</p>
+        <div id="deletePaperReasonContainer" class="hidden space-y-2">
+          <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-500" for="deletePaperReason">
+            Deletion Reason
+          </label>
+          <textarea
+            id="deletePaperReason"
+            class="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-red-600 focus:border-transparent outline-none resize-none"
+            rows="3"
+            placeholder="Please enter a deletion reason (minimum 5 characters)..."
+          ></textarea>
+          <p class="text-[10px] text-slate-400 italic">Your request will be reviewed by an administrator.</p>
+        </div>
         <div class="p-3 rounded-lg bg-slate-50 border border-slate-200">
           <p class="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">Paper</p>
           <p id="deletePaperTitle" class="text-sm font-semibold text-slate-900 break-words"></p>
@@ -1732,7 +1803,7 @@
             class="px-4 py-2 text-sm font-semibold bg-red-600 hover:bg-red-700 text-white rounded-lg shadow-sm transition flex items-center gap-1.5"
           >
             <i data-lucide="trash-2" class="w-4 h-4"></i>
-            <span>Delete</span>
+            <span id="deletePaperConfirmText">Delete</span>
           </button>
         </div>
       </div>
