@@ -2,6 +2,7 @@ node_modules/
 data/
 uploads/
 .env
+.password-key
 *.log
 .tmp-*.png
 .DS_Store

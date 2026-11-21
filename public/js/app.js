@@ -4,6 +4,7 @@ const API_BASE = '/api';
 const TOKEN_KEY = 'tis_repo_token';
 const USER_KEY = 'tis_repo_user';
 const THEME_KEY = 'tis_theme';
+const INVITATION_KEY = 'tis_invitation';
 
 // State
 let currentUser = null;
@@ -21,6 +22,9 @@ let mobileSidebarOpen = false;
 let pendingDeletePaperId = null;
 let pendingDeleteTeacherId = null;
 let teacherPapersCache = [];
+let deletionRequestsList = [];
+let currentDeletionRequest = null;
+let deletionPreviewPaper = null;
 let previewPaper = null;
 let previewObjectUrl = null;
 
@@ -98,14 +102,39 @@ function initLoginFeatureBackground() {
 }
 
 function saveCurrentUser() {
-  localStorage.setItem(USER_KEY, JSON.stringify(currentUser, (key, value) =>
-    key === 'plainTextNotice' ? undefined : value));
+  const { id, name, username, email, role, assignedSubjects, mustChangePassword } = currentUser;
+  localStorage.setItem(USER_KEY, JSON.stringify({ id, name, username, email, role, assignedSubjects, mustChangePassword }));
+}
+
+let sessionExpiryHandled = false;
+
+function clearAuthState() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+  currentToken = null;
+  currentUser = null;
+}
+
+function handleSessionExpired() {
+  if (sessionExpiryHandled) return;
+  sessionExpiryHandled = true;
+  clearAuthState();
+  showLoginView();
+  showToast('Your session expired. Please sign in again.', 'info');
+}
+
+async function apiFetch(url, options = {}) {
+  const res = await fetch(url, options);
+  if (res.status === 401 && currentToken) {
+    handleSessionExpired();
+  }
+  return res;
 }
 
 // Refresh user permissions
 async function refreshCurrentUser() {
   if (!currentToken) return;
-  const res = await fetch(`${API_BASE}/auth/me`, {
+  const res = await apiFetch(`${API_BASE}/auth/me`, {
     headers: { 'Authorization': `Bearer ${currentToken}` }
   });
   if (res.ok) {
@@ -159,6 +188,7 @@ function toggleMobileSidebar() {
   const sidebar = document.getElementById('mainSidebar');
   const backdrop = document.getElementById('sidebarBackdrop');
   mobileSidebarOpen = !mobileSidebarOpen;
+  document.getElementById('mobileMenuButton').setAttribute('aria-expanded', String(mobileSidebarOpen));
 
   if (mobileSidebarOpen) {
     sidebar.classList.remove('-translate-x-full');
@@ -168,6 +198,10 @@ function toggleMobileSidebar() {
     backdrop.classList.add('hidden');
   }
 }
+
+window.matchMedia('(min-width: 768px)').addEventListener('change', event => {
+  if (event.matches && mobileSidebarOpen) toggleMobileSidebar();
+});
 
 // Clickable sidebar section collapse/expand toggle
 function toggleSidebarSection(navId) {
@@ -242,7 +276,7 @@ function showDashboardTab(tabName) {
 
 // ==================== AUTHENTICATION ====================
 
-const REMEMBERED_USERNAME_KEY = 'tis_remembered_username';
+const REMEMBERED_EMAIL_KEY = 'tis_remembered_email';
 
 function setLoginPasswordVisible(visible) {
   const input = document.getElementById('loginPassword');
@@ -265,16 +299,16 @@ function toggleLoginPasswordVisibility() {
 }
 
 function restoreLoginPreferences() {
-  const usernameInput = document.getElementById('loginUsername');
+  const emailInput = document.getElementById('loginEmail');
   const remember = document.getElementById('loginRemember');
-  const saved = localStorage.getItem(REMEMBERED_USERNAME_KEY);
-  if (usernameInput && saved) usernameInput.value = saved;
+  const saved = localStorage.getItem(REMEMBERED_EMAIL_KEY);
+  if (emailInput && saved) emailInput.value = saved;
   if (remember) remember.checked = Boolean(saved);
 }
 
 async function handleLogin(e) {
   e.preventDefault();
-  const usernameInput = document.getElementById('loginUsername');
+  const emailInput = document.getElementById('loginEmail');
   const passwordInput = document.getElementById('loginPassword');
   const errorDiv = document.getElementById('loginError');
   const errorMsg = document.getElementById('loginErrorMessage');
@@ -289,8 +323,9 @@ async function handleLogin(e) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        username: usernameInput.value.trim(),
-        password: passwordInput.value.trim()
+        email: emailInput.value.trim(),
+        password: passwordInput.value.trim(),
+        invitationToken: sessionStorage.getItem(INVITATION_KEY) || ''
       })
     });
 
@@ -299,18 +334,19 @@ async function handleLogin(e) {
 
     currentToken = data.token;
     currentUser = data.user;
+    sessionExpiryHandled = false;
     localStorage.setItem(TOKEN_KEY, currentToken);
     saveCurrentUser();
 
     const remember = document.getElementById('loginRemember');
     if (remember && remember.checked) {
-      localStorage.setItem(REMEMBERED_USERNAME_KEY, usernameInput.value.trim());
+      localStorage.setItem(REMEMBERED_EMAIL_KEY, emailInput.value.trim());
     } else {
-      localStorage.removeItem(REMEMBERED_USERNAME_KEY);
+      localStorage.removeItem(REMEMBERED_EMAIL_KEY);
     }
 
     showAppView();
-    showToast(`Signed in as ${getDisplayName(currentUser)}!`, 'success');
+    if (!currentUser.mustChangePassword) showToast(`Signed in as ${getDisplayName(currentUser)}!`, 'success');
   } catch (err) {
     errorDiv.classList.remove('hidden');
     errorMsg.textContent = err.message;
@@ -336,17 +372,44 @@ function logout() {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     }).catch(() => {});
   }
-  localStorage.removeItem(TOKEN_KEY);
-  localStorage.removeItem(USER_KEY);
-  currentToken = null;
-  currentUser = null;
+  clearAuthState();
+  sessionExpiryHandled = false;
   showLoginView();
   showToast('Logged out successfully', 'info');
+}
+
+const FIRST_LOGIN_PASSWORD_FIELDS = {
+  firstLoginCurrent: 'temporary password',
+  firstLoginNew: 'new password',
+  firstLoginConfirm: 'password confirmation'
+};
+
+function setFirstLoginPasswordVisibility(id, visible) {
+  const input = document.getElementById(id);
+  const button = document.getElementById(`${id}Toggle`);
+  const icon = document.getElementById(`${id}Eye`);
+  const label = `${visible ? 'Hide' : 'Show'} ${FIRST_LOGIN_PASSWORD_FIELDS[id]}`;
+  input.type = visible ? 'text' : 'password';
+  button.setAttribute('aria-label', label);
+  button.title = label;
+  icon.setAttribute('data-lucide', visible ? 'eye-off' : 'eye');
+}
+
+function toggleFirstLoginPasswordVisibility(id) {
+  setFirstLoginPasswordVisibility(id, document.getElementById(id).type === 'password');
+  if (window.lucide) lucide.createIcons();
 }
 
 function showLoginView() {
   document.getElementById('loginSection').classList.remove('hidden');
   document.getElementById('appSection').classList.add('hidden');
+  document.getElementById('loginIntro').classList.remove('hidden');
+  document.getElementById('loginForm').classList.remove('hidden');
+  document.getElementById('firstLoginIntro').classList.add('hidden');
+  document.getElementById('firstLoginForm').classList.add('hidden');
+  document.getElementById('firstLoginForm').reset();
+  document.getElementById('firstLoginError').classList.add('hidden');
+  Object.keys(FIRST_LOGIN_PASSWORD_FIELDS).forEach(id => setFirstLoginPasswordVisibility(id, false));
 
   const passwordInput = document.getElementById('loginPassword');
   if (passwordInput) passwordInput.value = '';
@@ -360,9 +423,61 @@ function showLoginView() {
   if (window.lucide) lucide.createIcons();
 }
 
+function showFirstLoginView() {
+  document.getElementById('loginSection').classList.remove('hidden');
+  document.getElementById('appSection').classList.add('hidden');
+  document.getElementById('loginIntro').classList.add('hidden');
+  document.getElementById('loginForm').classList.add('hidden');
+  document.getElementById('firstLoginIntro').classList.remove('hidden');
+  document.getElementById('firstLoginForm').classList.remove('hidden');
+  document.getElementById('loginPassword').value = '';
+  document.getElementById('firstLoginCurrent').focus();
+  if (window.lucide) lucide.createIcons();
+}
+
+async function handleFirstLoginPassword(e) {
+  e.preventDefault();
+  const current = document.getElementById('firstLoginCurrent');
+  const password = document.getElementById('firstLoginNew');
+  const confirmation = document.getElementById('firstLoginConfirm');
+  const error = document.getElementById('firstLoginError');
+  const button = document.getElementById('firstLoginSubmit');
+  error.classList.add('hidden');
+
+  if (password.value.trim() !== confirmation.value.trim()) {
+    error.textContent = 'The new passwords do not match.';
+    error.classList.remove('hidden');
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = 'Saving...';
+  try {
+    const res = await apiFetch(`${API_BASE}/auth/password`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${currentToken}` },
+      body: JSON.stringify({ currentPassword: current.value.trim(), newPassword: password.value.trim() })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not update your password.');
+    currentUser = data.user;
+    saveCurrentUser();
+    sessionStorage.removeItem(INVITATION_KEY);
+    document.getElementById('firstLoginForm').reset();
+    Object.keys(FIRST_LOGIN_PASSWORD_FIELDS).forEach(id => setFirstLoginPasswordVisibility(id, false));
+    showAppView();
+    showToast('Password updated successfully.', 'success');
+  } catch (err) {
+    error.textContent = err.message;
+    error.classList.remove('hidden');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Save password';
+  }
+}
+
 // ==================== MY ACCOUNT ====================
 
-let accountPasswordVisible = false;
 let changePasswordVisible = false;
 const CHANGE_PASSWORD_FIELDS = ['accountCurrentInput', 'accountNewInput', 'accountConfirmInput'];
 
@@ -487,12 +602,9 @@ function openMyAccountModal() {
     officeEl.textContent = `Office: ${office}`;
   }
 
-  accountPasswordVisible = false;
-  renderAccountPassword();
-
   document.getElementById('editProfileForm').reset();
   document.getElementById('accountNameInput').value = name;
-  document.getElementById('accountUsernameInput').value = currentUser.username || '';
+  document.getElementById('accountEmailInput').value = currentUser.email || '';
   document.getElementById('accountProfileError').classList.add('hidden');
   document.getElementById('accountProfileSuccess').classList.add('hidden');
 
@@ -554,7 +666,7 @@ async function handleUpdateProfileSubmit(e) {
   if (window.lucide) lucide.createIcons();
 
   try {
-    const res = await fetch(`${API_BASE}/auth/profile`, {
+    const res = await apiFetch(`${API_BASE}/auth/profile`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -579,20 +691,6 @@ async function handleUpdateProfileSubmit(e) {
     submitBtn.innerHTML = originalBtn;
     if (window.lucide) lucide.createIcons();
   }
-}
-
-function renderAccountPassword() {
-  const el = document.getElementById('accountCurrentPassword');
-  const eye = document.getElementById('accountPasswordEye');
-  const value = (currentUser && currentUser.plainTextNotice) || '—';
-  el.textContent = accountPasswordVisible ? value : '••••••';
-  if (eye) eye.setAttribute('data-lucide', accountPasswordVisible ? 'eye-off' : 'eye');
-  if (window.lucide) lucide.createIcons();
-}
-
-function toggleAccountPasswordVisibility() {
-  accountPasswordVisible = !accountPasswordVisible;
-  renderAccountPassword();
 }
 
 async function handleChangePasswordSubmit(e) {
@@ -622,7 +720,7 @@ async function handleChangePasswordSubmit(e) {
   if (window.lucide) lucide.createIcons();
 
   try {
-    const res = await fetch(`${API_BASE}/auth/password`, {
+    const res = await apiFetch(`${API_BASE}/auth/password`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -637,12 +735,7 @@ async function handleChangePasswordSubmit(e) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Could not update password');
 
-    currentUser.plainTextNotice = newInput.value.trim();
-    saveCurrentUser();
-
     document.getElementById('changePasswordForm').reset();
-    accountPasswordVisible = false;
-    renderAccountPassword();
     setChangePasswordVisibility(false);
     successBox.classList.remove('hidden');
     showToast('Password updated successfully', 'success');
@@ -657,6 +750,10 @@ async function handleChangePasswordSubmit(e) {
 }
 
 function showAppView() {
+  if (currentUser.mustChangePassword) {
+    showFirstLoginView();
+    return;
+  }
   document.getElementById('loginSection').classList.add('hidden');
   document.getElementById('appSection').classList.remove('hidden');
 
@@ -722,7 +819,7 @@ function showAppView() {
 async function loadAdminStats() {
   if (currentUser.role !== 'admin') return;
   try {
-    const res = await fetch(`${API_BASE}/admin/teachers`, {
+    const res = await apiFetch(`${API_BASE}/admin/teachers`, {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
     if (res.ok) {
@@ -741,7 +838,7 @@ const adminCharts = { year: null, class: null };
 async function loadAdminDashboard() {
   if (!currentUser || currentUser.role !== 'admin') return;
   try {
-    const res = await fetch(`${API_BASE}/stats`, {
+    const res = await apiFetch(`${API_BASE}/stats`, {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
     if (!res.ok) return;
@@ -897,14 +994,16 @@ async function loadAdminDeletionRequests() {
   if (!currentUser || currentUser.role !== 'admin') return;
   
   try {
-    const res = await fetch(`${API_BASE}/admin/deletion-requests`, {
+    const res = await apiFetch(`${API_BASE}/admin/deletion-requests`, {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
     
+    if (res.status === 401) return;
     if (!res.ok) throw new Error('Failed to load deletion requests');
     
     const data = await res.json();
     const requests = data.requests || [];
+    deletionRequestsList = requests;
     
     // Update badge in sidebar
     const pendingCount = requests.filter(r => r.status === 'pending').length;
@@ -952,7 +1051,7 @@ async function loadAdminDeletionRequests() {
       
       return `
         <tr class="hover:bg-slate-50 transition">
-          <td class="px-5 py-4">
+          <td data-label="Paper" class="px-5 py-4">
             <div class="flex items-start gap-2">
               <i data-lucide="file-text" class="w-4 h-4 shrink-0 text-school-700 mt-0.5"></i>
               <div>
@@ -961,38 +1060,31 @@ async function loadAdminDeletionRequests() {
               </div>
             </div>
           </td>
-          <td class="px-5 py-4">
-            <div class="font-medium text-slate-800">${teacherName}</div>
-            <div class="text-[11px] text-slate-500">${escapeHtml(r.requestedByUsername)}</div>
+          <td data-label="Teacher" class="px-5 py-4">
+            <div><div class="font-medium text-slate-800">${teacherName}</div>
+            <div class="text-[11px] text-slate-500">${escapeHtml(r.requestedByUsername)}</div></div>
           </td>
-          <td class="px-5 py-4 text-xs text-slate-600">
+          <td data-label="Submitted" class="px-5 py-4 text-xs text-slate-600">
             <div>${submittedAt}</div>
           </td>
-          <td class="px-5 py-4">
+          <td data-label="Reason" class="px-5 py-4">
             ${reasonHtml}
           </td>
-          <td class="px-5 py-4 text-center">
+          <td data-label="Status" class="px-5 py-4 text-center">
             ${statusBadge}
           </td>
-          <td class="px-5 py-4 text-right whitespace-nowrap space-x-2">
-            ${r.status === 'pending' ? `
-              <button
-                onclick="handleApproveDeletionRequest('${r.id}', '${r.paperId}')"
-                class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-green-600 hover:bg-green-700 text-white transition inline-flex items-center gap-1"
-                title="Approve deletion"
-              >
-                <i data-lucide="check" class="w-3.5 h-3.5"></i>
-                Approve
-              </button>
-              <button
-                onclick="handleRejectDeletionRequest('${r.id}', '${r.paperId}')"
-                class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-600 hover:bg-red-700 text-white transition inline-flex items-center gap-1"
-                title="Reject deletion"
-              >
-                <i data-lucide="x" class="w-3.5 h-3.5"></i>
-                Reject
-              </button>
-            ` : ''}
+          <td data-label="Action" class="px-5 py-4 text-right whitespace-nowrap">
+            <button
+              type="button"
+              onclick="openDeletionRequestModal('${r.id}')"
+              class="p-2 rounded-lg ${r.status === 'pending'
+                ? 'bg-amber-600 hover:bg-amber-700 text-white'
+                : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'} transition inline-flex items-center justify-center"
+              title="${r.status === 'pending' ? 'Review deletion request' : 'View deletion request'}"
+              aria-label="${r.status === 'pending' ? 'Review deletion request' : 'View deletion request'}"
+            >
+              <i data-lucide="eye" class="w-4 h-4" aria-hidden="true"></i>
+            </button>
           </td>
         </tr>
       `;
@@ -1004,17 +1096,127 @@ async function loadAdminDeletionRequests() {
   }
 }
 
+function deletionRequestStatusBadge(status) {
+  if (status === 'pending') {
+    return '<span class="px-2.5 py-1 rounded-full text-xs font-bold bg-amber-100 text-amber-800 border border-amber-200 inline-flex items-center gap-1"><i data-lucide="clock" class="w-3.5 h-3.5"></i> Pending review</span>';
+  }
+  if (status === 'approved') {
+    return '<span class="px-2.5 py-1 rounded-full text-xs font-bold bg-green-100 text-green-800 border border-green-200 inline-flex items-center gap-1"><i data-lucide="check" class="w-3.5 h-3.5"></i> Approved</span>';
+  }
+  if (status === 'rejected') {
+    return '<span class="px-2.5 py-1 rounded-full text-xs font-bold bg-red-100 text-red-800 border border-red-200 inline-flex items-center gap-1"><i data-lucide="x" class="w-3.5 h-3.5"></i> Rejected</span>';
+  }
+  return '';
+}
+
+function openDeletionRequestModal(requestId) {
+  const request = deletionRequestsList.find(r => r.id === requestId);
+  if (!request) {
+    showToast('Deletion request not found', 'error');
+    return;
+  }
+
+  currentDeletionRequest = request;
+  const paper = request.paper || null;
+  const paperTitle = request.paperTitle || (paper && paper.title) || 'Unknown paper';
+  const submittedAt = request.createdAt ? new Date(request.createdAt).toLocaleString() : 'Unknown date';
+  const metaParts = [
+    request.paperSubject || (paper && paper.subject),
+    paper && paper.classYear,
+    paper && paper.term,
+    paper && paper.academicYear
+  ].filter(Boolean);
+
+  document.getElementById('deletionRequestPaperTitle').textContent = paperTitle;
+  document.getElementById('deletionRequestPaperMeta').textContent = metaParts.join(' • ') || 'Paper details unavailable';
+  document.getElementById('deletionRequestTeacherName').textContent = request.requestedByName || request.requestedByUsername || 'Unknown teacher';
+  document.getElementById('deletionRequestTeacherUsername').textContent = request.requestedByUsername ? '@' + request.requestedByUsername : '';
+  document.getElementById('deletionRequestSubmittedAt').textContent = `Submitted ${submittedAt}`;
+  document.getElementById('deletionRequestReason').textContent = request.reason || 'No reason provided.';
+  document.getElementById('deletionRequestStatus').innerHTML = deletionRequestStatusBadge(request.status);
+
+  const outcome = document.getElementById('deletionRequestOutcome');
+  const outcomeTitle = document.getElementById('deletionRequestOutcomeTitle');
+  const outcomeText = document.getElementById('deletionRequestOutcomeText');
+  outcome.className = 'hidden p-3.5 rounded-xl border text-sm';
+  outcomeTitle.textContent = '';
+  outcomeText.textContent = '';
+
+  if (request.status === 'approved') {
+    outcome.classList.remove('hidden');
+    outcome.classList.add('border-green-200', 'bg-green-50', 'text-green-900');
+    outcomeTitle.textContent = 'Request approved';
+    const processedAt = request.processedAt ? new Date(request.processedAt).toLocaleString() : '';
+    outcomeText.textContent = [
+      processedAt ? `Processed ${processedAt}.` : '',
+      request.note || 'The paper was removed from the repository.'
+    ].filter(Boolean).join(' ');
+  } else if (request.status === 'rejected') {
+    outcome.classList.remove('hidden');
+    outcome.classList.add('border-red-200', 'bg-red-50', 'text-red-900');
+    outcomeTitle.textContent = 'Request rejected';
+    const processedAt = request.processedAt ? new Date(request.processedAt).toLocaleString() : '';
+    outcomeText.textContent = [
+      processedAt ? `Processed ${processedAt}.` : '',
+      request.rejectionReason ? `Reason: ${request.rejectionReason}` : 'No rejection reason was recorded.'
+    ].filter(Boolean).join(' ');
+  }
+
+  const isPending = request.status === 'pending';
+  document.getElementById('deletionRequestApproveBtn').classList.toggle('hidden', !isPending);
+  document.getElementById('deletionRequestRejectBtn').classList.toggle('hidden', !isPending);
+  document.getElementById('deletionRequestViewPaperBtn').classList.toggle('hidden', !paper);
+  document.getElementById('deletionRequestPaperMissing').classList.toggle('hidden', !!paper);
+
+  const modal = document.getElementById('deletionRequestModal');
+  if (modal) modal.classList.remove('hidden');
+  if (window.lucide) lucide.createIcons();
+}
+
+function closeDeletionRequestModal() {
+  const modal = document.getElementById('deletionRequestModal');
+  if (modal) modal.classList.add('hidden');
+  currentDeletionRequest = null;
+}
+
+function viewDeletionRequestPaper() {
+  const paper = currentDeletionRequest && currentDeletionRequest.paper;
+  if (!paper) {
+    showToast('This paper is no longer available.', 'warning');
+    return;
+  }
+  deletionPreviewPaper = paper;
+  openPreviewModal(paper.id);
+}
+
+function approveDeletionRequestFromModal() {
+  if (!currentDeletionRequest) return;
+  handleApproveDeletionRequest(currentDeletionRequest.id, currentDeletionRequest.paperId);
+}
+
+function rejectDeletionRequestFromModal() {
+  if (!currentDeletionRequest) return;
+  handleRejectDeletionRequest(currentDeletionRequest.id, currentDeletionRequest.paperId);
+}
+
 async function handleApproveDeletionRequest(requestId, paperId) {
-  if (!confirm('Approve this deletion? The paper will be permanently removed.')) return;
+  const request = deletionRequestsList.find(r => r.id === requestId);
+  const title = request ? request.paperTitle : 'this paper';
+  if (!confirm(`Approve deletion of "${title}"? The paper will be permanently removed.`)) return;
   
   try {
-    const res = await fetch(`${API_BASE}/admin/deletion-requests/${requestId}/approve`, {
+    const res = await apiFetch(`${API_BASE}/admin/deletion-requests/${requestId}/approve`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
     
-    if (!res.ok) throw new Error('Failed to approve deletion');
+    if (res.status === 401) return;
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Failed to approve deletion');
+    }
     
+    closeDeletionRequestModal();
     showToast('Deletion approved and paper removed', 'success');
     loadAdminDeletionRequests();
     fetchPapers();
@@ -1024,11 +1226,13 @@ async function handleApproveDeletionRequest(requestId, paperId) {
 }
 
 async function handleRejectDeletionRequest(requestId, paperId) {
-  const reason = prompt('Please provide a reason for rejection (optional):');
+  const request = deletionRequestsList.find(r => r.id === requestId);
+  const title = request ? request.paperTitle : 'this paper';
+  const reason = prompt(`Reject the deletion request for "${title}"?\n\nOptional reason for the teacher:`);
   if (reason === null) return;
   
   try {
-    const res = await fetch(`${API_BASE}/admin/deletion-requests/${requestId}/reject`, {
+    const res = await apiFetch(`${API_BASE}/admin/deletion-requests/${requestId}/reject`, {
       method: 'POST',
       headers: { 
         'Authorization': `Bearer ${currentToken}`,
@@ -1037,8 +1241,13 @@ async function handleRejectDeletionRequest(requestId, paperId) {
       body: JSON.stringify({ reason: reason || '' })
     });
     
-    if (!res.ok) throw new Error('Failed to reject deletion');
+    if (res.status === 401) return;
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Failed to reject deletion');
+    }
     
+    closeDeletionRequestModal();
     showToast('Deletion request rejected', 'success');
     loadAdminDeletionRequests();
     fetchPapers();
@@ -1249,7 +1458,7 @@ function getClassYears() {
 
 async function loadClassYears() {
   try {
-    const res = await fetch(`${API_BASE}/classes`, {
+    const res = await apiFetch(`${API_BASE}/classes`, {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
     if (!res.ok) return;
@@ -1292,7 +1501,7 @@ function populateClassSelects() {
 
 async function fetchStats() {
   try {
-    const res = await fetch(`${API_BASE}/stats`, {
+    const res = await apiFetch(`${API_BASE}/stats`, {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
     if (!res.ok) return;
@@ -1414,12 +1623,11 @@ async function fetchPapers() {
   `;
 
   try {
-    const res = await fetch(`${API_BASE}/papers?${params.toString()}`, {
+    const res = await apiFetch(`${API_BASE}/papers?${params.toString()}`, {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
 
     if (res.status === 401) {
-      logout();
       return;
     }
 
@@ -1463,7 +1671,7 @@ function renderGridView(papers) {
   const canDelete = currentUser && (currentUser.role === 'teacher' || currentUser.role === 'admin');
 
   container.innerHTML = `
-    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-1.5 animate-fade-in">
+    <div class="papers-grid grid grid-cols-1 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-2 sm:gap-1.5 animate-fade-in">
       ${papers.map(p => {
         const isBio = p.subject === 'Biology';
         const badgeClass = isBio ? 'badge-biology' : 'badge-chemistry';
@@ -1489,7 +1697,7 @@ function renderGridView(papers) {
         return `
           <div class="${p.deletionStatus === 'approved' ? 'opacity-50' : ''} paper-card bg-white rounded border border-slate-200 hover:border-school-400 shadow-sm flex flex-col justify-between overflow-hidden text-xs relative">
             ${statusIndicator}
-            <div class="p-1.5 flex-1">
+            <div class="paper-card-content p-1.5 flex-1">
               <div class="flex items-center justify-between gap-0.5 mb-1 flex-wrap">
                 <div class="flex items-center gap-0.5">
                   <span class="px-0.5 py-0.5 rounded-full text-[7px] font-semibold ${badgeClass} flex items-center gap-0.5">
@@ -1521,7 +1729,7 @@ function renderGridView(papers) {
               </div>
             </div>
 
-            <div class="px-1.5 py-0.5 bg-slate-50 border-t border-slate-100 flex items-center justify-between">
+            <div class="paper-card-footer px-1.5 py-0.5 bg-slate-50 border-t border-slate-100 flex items-center justify-between">
               <span class="text-[7px] text-slate-400">${p.downloadsCount || 0}↓</span>
 
               <div class="flex items-center gap-0.5">
@@ -1574,7 +1782,7 @@ function renderTableView(papers) {
   container.innerHTML = `
     <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden animate-fade-in">
       <div class="overflow-x-auto">
-        <table class="w-full table-fixed text-left text-sm text-slate-600">
+        <table class="mobile-card-table w-full table-fixed text-left text-sm text-slate-600">
           <thead class="bg-school-800 text-[11px] uppercase font-semibold text-white border-b border-school-900">
             <tr>
               <th class="px-2.5 py-3">Paper</th>
@@ -1606,7 +1814,7 @@ function renderTableView(papers) {
 
               return `
                 <tr class="${p.deletionStatus === 'approved' ? 'opacity-50' : ''} hover:bg-slate-50 transition">
-                  <td class="px-2.5 py-2.5">
+                  <td data-label="Paper" class="px-2.5 py-2.5">
                     <div class="flex min-w-0 items-center gap-2">
                       <i data-lucide="file-text" class="w-4 h-4 shrink-0 text-school-700"></i>
                       <div class="min-w-0">
@@ -1615,28 +1823,28 @@ function renderTableView(papers) {
                       </div>
                     </div>
                   </td>
-                  <td class="px-2.5 py-2.5 whitespace-nowrap">
+                  <td data-label="Class" class="px-2.5 py-2.5 whitespace-nowrap">
                     <span class="px-2 py-0.5 rounded font-bold text-xs bg-school-50 text-school-800 border border-school-200">
                       ${p.classYear}
                     </span>
                   </td>
-                  <td class="px-2.5 py-2.5 whitespace-nowrap">
+                  <td data-label="Subject" class="px-2.5 py-2.5 whitespace-nowrap">
                     <span class="px-2 py-0.5 rounded-full text-xs font-semibold ${badgeClass}">
                       ${p.subject}
                     </span>
                   </td>
-                  <td class="hidden px-2.5 py-2.5 whitespace-nowrap text-xs text-slate-600 sm:table-cell">
-                    <span class="font-bold text-slate-700">${p.academicYear}</span>
+                  <td data-label="Year / Term" class="hidden px-2.5 py-2.5 whitespace-nowrap text-xs text-slate-600 sm:table-cell">
+                    <div><span class="font-bold text-slate-700">${p.academicYear}</span>
                     <span class="text-slate-400">·</span>
-                    ${p.term}
+                    ${p.term}</div>
                   </td>
-                  <td class="hidden px-2.5 py-2.5 text-xs text-slate-500 lg:table-cell">
+                  <td data-label="Category" class="hidden px-2.5 py-2.5 text-xs text-slate-500 lg:table-cell">
                     <span class="block truncate" title="${escapeHtml(p.paperType || '')}">${escapeHtml(p.paperType || '')}</span>
                   </td>
-                  <td class="px-2.5 py-2.5 whitespace-nowrap text-center">
-                    ${statusBadge}
+                  <td data-label="Status" class="px-2.5 py-2.5 whitespace-nowrap text-center">
+                    ${statusBadge || '—'}
                   </td>
-                  <td class="px-2.5 py-2.5 whitespace-nowrap text-right">
+                  <td data-label="Actions" class="px-2.5 py-2.5 whitespace-nowrap text-right">
                     <div class="inline-flex items-center gap-1">
                     <button 
                       onclick="openPreviewModal('${p.id}')"
@@ -1797,7 +2005,7 @@ async function handleUploadSubmit(e) {
   submitBtn.innerHTML = `<span>Uploading...</span>`;
 
   try {
-    const res = await fetch(`${API_BASE}/papers`, {
+    const res = await apiFetch(`${API_BASE}/papers`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${currentToken}` },
       body: formData
@@ -1822,7 +2030,9 @@ async function handleUploadSubmit(e) {
 // ==================== PREVIEW ====================
 
 function openPreviewModal(id) {
-  const paper = papersList.find(p => p.id === id) || teacherPapersCache.find(p => p.id === id);
+  const paper = papersList.find(p => p.id === id)
+    || teacherPapersCache.find(p => p.id === id)
+    || (deletionPreviewPaper && deletionPreviewPaper.id === id ? deletionPreviewPaper : null);
   if (!paper) {
     showToast('Paper not found', 'error');
     return;
@@ -1870,11 +2080,10 @@ function openPreviewModal(id) {
     return;
   }
 
-  fetch(`${API_BASE}/papers/${id}/view`, {
+  apiFetch(`${API_BASE}/papers/${id}/view`, {
     headers: { 'Authorization': `Bearer ${currentToken}` }
   }).then(async res => {
     if (res.status === 401) {
-      logout();
       return;
     }
     if (!res.ok) {
@@ -1914,6 +2123,7 @@ function revokePreviewUrl() {
 function closePreviewModal() {
   const modal = document.getElementById('previewModal');
   if (modal) modal.classList.add('hidden');
+  deletionPreviewPaper = null;
 
   const frame = document.getElementById('previewFrame');
   const image = document.getElementById('previewImage');
@@ -1948,10 +2158,11 @@ async function downloadPaper(id, filename) {
   }
   try {
     showToast('Downloading paper...', 'info');
-    const res = await fetch(`${API_BASE}/papers/${id}/download`, {
+    const res = await apiFetch(`${API_BASE}/papers/${id}/download`, {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
 
+    if (res.status === 401) return;
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || 'Could not download file');
@@ -2048,7 +2259,7 @@ async function confirmDeletePaper() {
   }
 
   try {
-    const res = await fetch(`${API_BASE}/papers/${id}`, {
+    const res = await apiFetch(`${API_BASE}/papers/${id}`, {
       method: 'DELETE',
       headers,
       body
@@ -2089,7 +2300,6 @@ async function confirmDeletePaper() {
 
 async function loadAdminTeachersTable() {
   if (!currentUser || currentUser.role !== 'admin') return;
-  console.log('Loading admin teachers table...');
   const tbody = document.getElementById('adminTeachersTableBody');
   const countBadge = document.getElementById('adminTableCountBadge');
 
@@ -2100,7 +2310,7 @@ async function loadAdminTeachersTable() {
 
   tbody.innerHTML = `
     <tr>
-      <td colspan="6" class="px-5 py-12 text-center text-slate-400">
+      <td colspan="5" class="px-5 py-12 text-center text-slate-400">
         <div class="inline-block animate-spin w-6 h-6 border-3 border-purple-600 border-t-transparent rounded-full mb-2"></div>
         <p class="text-xs">Loading faculty members...</p>
       </td>
@@ -2108,17 +2318,15 @@ async function loadAdminTeachersTable() {
   `;
 
   try {
-    console.log('Fetching teachers from API...');
-    const res = await fetch(`${API_BASE}/admin/teachers`, {
+    const res = await apiFetch(`${API_BASE}/admin/teachers`, {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
 
-    console.log('API Response status:', res.status);
+    if (res.status === 401) return;
     if (!res.ok) throw new Error('Failed to load teachers');
     const data = await res.json();
     
     teachersList = data.teachers || [];
-    console.log('Number of teachers:', teachersList.length);
     
     countBadge.textContent = `${teachersList.length} ${teachersList.length === 1 ? 'teacher' : 'teachers'}`;
     document.getElementById('sideBadgeTeachersCount').textContent = teachersList.length;
@@ -2126,7 +2334,7 @@ async function loadAdminTeachersTable() {
     if (teachersList.length === 0) {
       tbody.innerHTML = `
         <tr>
-          <td colspan="6" class="px-5 py-10 text-center text-slate-400">
+          <td colspan="5" class="px-5 py-10 text-center text-slate-400">
             No teachers registered yet. Click "Register New Teacher" above to add one.
           </td>
         </tr>
@@ -2151,7 +2359,7 @@ async function loadAdminTeachersTable() {
 
       return `
         <tr class="hover:bg-slate-50 transition">
-          <td class="px-5 py-4">
+          <td data-label="Teacher" class="px-5 py-4">
             <div class="flex items-center space-x-3">
               <div class="w-9 h-9 rounded-xl bg-purple-100 text-purple-800 flex items-center justify-center font-bold text-sm shrink-0 border border-purple-200">
                 ${escapeHtml(t.name.charAt(0).toUpperCase())}
@@ -2159,26 +2367,31 @@ async function loadAdminTeachersTable() {
               <div>
                 <div class="font-bold text-slate-800 text-sm">${escapeHtml(t.name)}</div>
                 <div class="text-[11px] text-slate-400">Added on ${new Date(t.createdAt).toLocaleDateString()}</div>
+                ${t.mustChangePassword ? '<div class="text-[11px] font-semibold text-amber-700">Invitation pending</div>' : ''}
               </div>
             </div>
           </td>
-          <td class="px-5 py-4 font-mono text-xs text-slate-700">
-            <span class="bg-slate-100 px-2 py-1 rounded border border-slate-200">${escapeHtml(t.username)}</span>
+          <td data-label="Email" class="px-5 py-4 font-mono text-xs text-slate-700">
+            <span class="bg-slate-100 px-2 py-1 rounded border border-slate-200">${escapeHtml(t.email || 'Email not set')}</span>
           </td>
-          <td class="px-5 py-4 whitespace-nowrap">
+          <td data-label="Subjects" class="px-5 py-4 whitespace-nowrap">
             ${badgeHtml}
           </td>
-          <td class="px-5 py-4 whitespace-nowrap font-mono text-xs text-purple-700 font-bold">
-            <span class="bg-purple-50 border border-purple-200 px-2 py-0.5 rounded">${escapeHtml(t.plainTextNotice || '123')}</span>
-          </td>
-          <td class="px-5 py-4 text-center font-bold text-sm text-slate-700">
+          <td data-label="Uploaded Papers" class="px-5 py-4 text-center font-bold text-sm text-slate-700">
             <span class="px-2.5 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-xs">${t.papersCount || 0}</span>
           </td>
-          <td class="px-5 py-4 text-right whitespace-nowrap space-x-1">
+          <td data-label="Actions" class="px-5 py-4 text-right whitespace-nowrap">
+            <div class="inline-flex flex-wrap gap-1">
+            ${t.mustChangePassword ? `
+              <button type="button" onclick="resendTeacherInvitation('${t.id}', this)"
+                class="px-2 py-2 rounded-lg text-xs font-semibold text-school-700 hover:bg-school-50 border border-school-200 transition inline-flex items-center"
+                title="Resend invitation" aria-label="Resend invitation">
+                <i data-lucide="mail" class="w-4 h-4"></i>
+              </button>` : ''}
             <button 
               onclick="openViewTeacherModal('${t.id}')"
               class="px-2 py-2 rounded-lg text-xs font-semibold text-slate-600 hover:text-slate-900 hover:bg-slate-200 transition inline-flex items-center"
-              title="View Details"
+              title="View Details" aria-label="View teacher details"
             >
               <i data-lucide="eye" class="w-4 h-4"></i>
             </button>
@@ -2186,7 +2399,7 @@ async function loadAdminTeachersTable() {
             <button 
               onclick="openEditTeacherModal('${t.id}')"
               class="px-2 py-2 rounded-lg text-xs font-semibold text-indigo-700 hover:bg-indigo-50 border border-indigo-200 transition inline-flex items-center"
-              title="Edit Teacher"
+              title="Edit Teacher" aria-label="Edit teacher"
             >
               <i data-lucide="pencil" class="w-4 h-4"></i>
             </button>
@@ -2194,10 +2407,11 @@ async function loadAdminTeachersTable() {
             <button 
               onclick="openDeleteTeacherModal('${t.id}')"
               class="px-2 py-2 rounded-lg text-xs font-semibold text-red-600 hover:bg-red-50 border border-red-200 transition inline-flex items-center"
-              title="Delete Teacher"
+              title="Delete Teacher" aria-label="Delete teacher"
             >
               <i data-lucide="trash-2" class="w-4 h-4"></i>
             </button>
+            </div>
           </td>
         </tr>
       `;
@@ -2212,7 +2426,7 @@ async function loadAdminTeachersTable() {
     console.error('Error loading teachers:', err);
     tbody.innerHTML = `
       <tr>
-        <td colspan="6" class="px-5 py-10 text-center text-red-600 bg-red-50">
+        <td colspan="5" class="px-5 py-10 text-center text-red-600 bg-red-50">
           <div class="text-sm font-semibold">Failed to load teachers</div>
           <div class="text-xs mt-1">${err.message}</div>
         </td>
@@ -2221,12 +2435,27 @@ async function loadAdminTeachersTable() {
   }
 }
 
+async function resendTeacherInvitation(id, button) {
+  button.disabled = true;
+  try {
+    const res = await apiFetch(`${API_BASE}/admin/teachers/${encodeURIComponent(id)}/invitation`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${currentToken}` }
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Could not resend the invitation.');
+    showToast(data.message, data.notificationStatus === 'sent' ? 'success' : 'warning');
+  } catch (err) {
+    showToast(err.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+}
+
 // Open/Close Add Teacher Modal
 function openAddTeacherModal() {
   document.getElementById('addTeacherModal').classList.remove('hidden');
   document.getElementById('addTeacherForm').reset();
-  // Ensure default password of 123 is pre-filled
-  document.getElementById('newTeacherPassword').value = '123';
   document.getElementById('addTeacherError').classList.add('hidden');
   if (window.lucide) lucide.createIcons();
 }
@@ -2262,7 +2491,7 @@ async function handleAddClassSubmit(e) {
   btn.innerHTML = '<span>Adding...</span>';
 
   try {
-    const res = await fetch(`${API_BASE}/classes`, {
+    const res = await apiFetch(`${API_BASE}/classes`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -2300,7 +2529,6 @@ async function handleAddTeacherSubmit(e) {
   const emailInput = document.getElementById('newTeacherEmail');
   const phoneInput = document.getElementById('newTeacherPhone');
   const usernameInput = document.getElementById('newTeacherUsername');
-  const passwordInput = document.getElementById('newTeacherPassword');
   const subjectSelect = document.getElementById('newTeacherSubjects');
   const errorDiv = document.getElementById('addTeacherError');
   const btn = document.getElementById('addTeacherSubmitBtn');
@@ -2316,11 +2544,8 @@ async function handleAddTeacherSubmit(e) {
     assignedSubjects = [subjectSelect.value];
   }
 
-  // Default to 123 if empty
-  const passwordVal = passwordInput.value.trim() || '123';
-
   try {
-    const res = await fetch(`${API_BASE}/admin/teachers`, {
+    const res = await apiFetch(`${API_BASE}/admin/teachers`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -2331,7 +2556,6 @@ async function handleAddTeacherSubmit(e) {
         email: emailInput.value.trim(),
         phone: phoneInput.value.trim(),
         username: usernameInput.value.trim(),
-        password: passwordVal,
         assignedSubjects
       })
     });
@@ -2340,7 +2564,7 @@ async function handleAddTeacherSubmit(e) {
     if (!res.ok) throw new Error(data.error || 'Failed to register teacher.');
 
     closeAddTeacherModal();
-    showToast(`Teacher "${data.teacher.name}" registered with default password (123)!`, 'success');
+    showToast(data.message, data.notificationStatus === 'sent' ? 'success' : 'warning');
     loadAdminTeachersTable();
   } catch (err) {
     errorDiv.textContent = err.message;
@@ -2379,6 +2603,7 @@ function openEditTeacherModal(teacherId) {
 }
 
 function closeEditTeacherModal() {
+  document.getElementById('editTeacherPassword').value = '';
   document.getElementById('editTeacherModal').classList.add('hidden');
 }
 
@@ -2409,7 +2634,7 @@ async function handleEditTeacherSubmit(e) {
     const payload = { name, email, phone, username, assignedSubjects };
     if (password) payload.password = password;
 
-    const res = await fetch(`${API_BASE}/admin/teachers/${id}`, {
+    const res = await apiFetch(`${API_BASE}/admin/teachers/${id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -2422,7 +2647,7 @@ async function handleEditTeacherSubmit(e) {
     if (!res.ok) throw new Error(data.error || 'Failed to update teacher.');
 
     closeEditTeacherModal();
-    showToast(`Teacher "${data.teacher.name}" updated successfully!`, 'success');
+    showToast(data.message, 'success');
     loadAdminTeachersTable();
   } catch (err) {
     errorDiv.textContent = err.message;
@@ -2436,7 +2661,7 @@ async function handleEditTeacherSubmit(e) {
 // View Teacher Details Modal
 async function openViewTeacherModal(teacherId) {
   try {
-    const res = await fetch(`${API_BASE}/admin/teachers/${teacherId}/details`, {
+    const res = await apiFetch(`${API_BASE}/admin/teachers/${teacherId}/details`, {
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });
 
@@ -2449,10 +2674,10 @@ async function openViewTeacherModal(teacherId) {
     document.getElementById('detailTeacherAvatar').textContent = teacher.name.charAt(0).toUpperCase();
     document.getElementById('detailTeacherName').textContent = teacher.name;
     document.getElementById('detailTeacherUsername').textContent = '@' + teacher.username;
-    document.getElementById('detailTeacherPassword').textContent = teacher.plainTextNotice || '123';
     document.getElementById('detailTeacherDate').textContent = new Date(teacher.createdAt).toLocaleDateString();
     document.getElementById('detailTeacherEmail').textContent = teacher.email || '—';
     document.getElementById('detailTeacherPhone').textContent = teacher.phone || '—';
+    document.getElementById('detailTeacherPassword').textContent = teacher.password ?? 'Unavailable until the teacher signs in or their password is reset.';
 
     const scopeBadge = document.getElementById('detailTeacherScopeBadge');
     const subjects = teacher.assignedSubjects || [];
@@ -2507,6 +2732,7 @@ async function openViewTeacherModal(teacherId) {
 
 function closeViewTeacherModal() {
   document.getElementById('viewTeacherModal').classList.add('hidden');
+  document.getElementById('detailTeacherPassword').textContent = '';
 }
 
 function openDeleteTeacherModal(id) {
@@ -2545,7 +2771,7 @@ async function confirmDeleteTeacher() {
   }
 
   try {
-    const res = await fetch(`${API_BASE}/admin/teachers/${id}`, {
+    const res = await apiFetch(`${API_BASE}/admin/teachers/${id}`, {
       method: 'DELETE',
       headers: { 'Authorization': `Bearer ${currentToken}` }
     });

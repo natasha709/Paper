@@ -4,6 +4,8 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const multer = require('multer');
+const nodemailer = require('nodemailer');
+require('dotenv').config({ path: path.join(__dirname, '.env'), quiet: true });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,28 +31,259 @@ if (!fs.existsSync(PAPERS_FILE)) fs.writeFileSync(PAPERS_FILE, '[]', 'utf8');
 const DELETION_REQUESTS_FILE = path.join(DATA_DIR, 'deletion_requests.json');
 if (!fs.existsSync(DELETION_REQUESTS_FILE)) fs.writeFileSync(DELETION_REQUESTS_FILE, '[]', 'utf8');
 
-// Helper to hash password
-function hashPassword(password) {
-  return crypto.createHash('sha256').update(password.trim()).digest('hex');
+const SCRYPT_OPTIONS = { N: 32768, r: 8, p: 3, maxmem: 64 * 1024 * 1024 };
+
+function hashToken(value) {
+  return crypto.createHash('sha256').update(value.trim()).digest('hex');
 }
+
+function hashPassword(password, legacyHash = false) {
+  const salt = crypto.randomBytes(16);
+  const derived = crypto.scryptSync(password.trim(), salt, 32, SCRYPT_OPTIONS);
+  return `${legacyHash ? 'scrypt-sha256' : 'scrypt'}$${salt.toString('hex')}$${derived.toString('hex')}`;
+}
+
+function verifyPassword(password, storedHash) {
+  const parts = typeof storedHash === 'string' ? storedHash.split('$') : [];
+  if (parts.length !== 3 || !['scrypt', 'scrypt-sha256'].includes(parts[0]) ||
+      !/^[a-f0-9]{32}$/.test(parts[1]) || !/^[a-f0-9]{64}$/.test(parts[2])) return false;
+  const input = parts[0] === 'scrypt-sha256' ? hashToken(password) : password.trim();
+  const expected = Buffer.from(parts[2], 'hex');
+  const actual = crypto.scryptSync(input, Buffer.from(parts[1], 'hex'), expected.length, SCRYPT_OPTIONS);
+  return crypto.timingSafeEqual(actual, expected);
+}
+
+function loadPasswordEncryptionKey() {
+  let encoded = (process.env.PASSWORD_ENCRYPTION_KEY || '').trim();
+  if (!encoded && process.env.NODE_ENV !== 'production') {
+    const keyFile = path.join(__dirname, '.password-key');
+    if (!fs.existsSync(keyFile)) {
+      if (fs.existsSync(USERS_FILE)) {
+        const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+        if (!Array.isArray(users)) throw new Error('User data must be an array.');
+        if (users.some(user => user.encryptedPassword)) {
+          throw new Error('The local password encryption key is missing. Restore the original key.');
+        }
+      }
+      fs.writeFileSync(keyFile, crypto.randomBytes(32).toString('base64'), { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    }
+    encoded = fs.readFileSync(keyFile, 'utf8').trim();
+  }
+  if (!/^[A-Za-z0-9+/]{43}=$/.test(encoded)) {
+    throw new Error('PASSWORD_ENCRYPTION_KEY must be a base64-encoded 32-byte key.');
+  }
+  const key = Buffer.from(encoded, 'base64');
+  if (key.length !== 32 || key.toString('base64') !== encoded) {
+    throw new Error('PASSWORD_ENCRYPTION_KEY must be a base64-encoded 32-byte key.');
+  }
+  return key;
+}
+
+function encryptTeacherPassword(password, userId) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', passwordEncryptionKey, iv);
+  cipher.setAAD(Buffer.from(userId));
+  const ciphertext = Buffer.concat([cipher.update(password.trim(), 'utf8'), cipher.final()]);
+  return `v1$${iv.toString('hex')}$${cipher.getAuthTag().toString('hex')}$${ciphertext.toString('base64')}`;
+}
+
+function decryptTeacherPassword(value, userId) {
+  const parts = typeof value === 'string' ? value.split('$') : [];
+  if (parts.length !== 4 || parts[0] !== 'v1' || !/^[a-f0-9]{24}$/.test(parts[1]) ||
+      !/^[a-f0-9]{32}$/.test(parts[2]) || !/^[A-Za-z0-9+/]+={0,2}$/.test(parts[3])) {
+    throw new Error('Stored teacher password is invalid.');
+  }
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', passwordEncryptionKey, Buffer.from(parts[1], 'hex'));
+    decipher.setAAD(Buffer.from(userId));
+    decipher.setAuthTag(Buffer.from(parts[2], 'hex'));
+    return Buffer.concat([decipher.update(Buffer.from(parts[3], 'base64')), decipher.final()]).toString('utf8');
+  } catch {
+    throw new Error('Unable to decrypt a stored teacher password. Check the encryption key.');
+  }
+}
+
+function writeUsers(users) {
+  const temporaryPath = `${USERS_FILE}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  let file;
+  let created = false;
+  try {
+    file = fs.openSync(temporaryPath, 'wx', 0o600);
+    created = true;
+    fs.writeFileSync(file, JSON.stringify(users, null, 2), 'utf8');
+    fs.closeSync(file);
+    file = undefined;
+    fs.renameSync(temporaryPath, USERS_FILE);
+    created = false;
+  } finally {
+    if (file !== undefined) fs.closeSync(file);
+    if (created) fs.unlinkSync(temporaryPath);
+  }
+}
+
+function migratePasswords() {
+  const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+  if (!Array.isArray(users)) throw new Error('User data must be an array.');
+  let changed = false;
+  for (const user of users) {
+    const protectedHash = /^(scrypt|scrypt-sha256)\$[a-f0-9]{32}\$[a-f0-9]{64}$/.test(user.passwordHash || '');
+    if (user.role === 'teacher') {
+      if (Object.hasOwn(user, 'encryptedPassword')) {
+        decryptTeacherPassword(user.encryptedPassword, user.id);
+      } else if (typeof user.plainTextNotice === 'string' && user.plainTextNotice.trim() &&
+          (protectedHash ? verifyPassword(user.plainTextNotice, user.passwordHash) :
+           !user.passwordHash || hashToken(user.plainTextNotice) === user.passwordHash)) {
+        user.encryptedPassword = encryptTeacherPassword(user.plainTextNotice, user.id);
+        changed = true;
+      }
+    }
+    if (protectedHash) {
+      if (Object.hasOwn(user, 'plainTextNotice')) {
+        delete user.plainTextNotice;
+        changed = true;
+      }
+      continue;
+    }
+    const legacyHash = user.passwordHash;
+    const plain = user.plainTextNotice;
+    if (typeof plain === 'string' && plain.trim()) {
+      if (legacyHash && !/^[a-f0-9]{64}$/.test(legacyHash)) {
+        throw new Error(`Password record for account ${user.id} is invalid; migration stopped.`);
+      }
+      user.passwordHash = hashPassword(plain);
+      // Older records could authenticate against either conflicting value.
+      if (legacyHash && hashToken(plain) !== legacyHash) {
+        user.alternatePasswordHash = hashPassword(legacyHash, true);
+      }
+    } else if (typeof legacyHash === 'string' && /^[a-f0-9]{64}$/.test(legacyHash)) {
+      user.passwordHash = hashPassword(legacyHash, true);
+    } else {
+      throw new Error(`Password record for account ${user.id} is invalid; migration stopped.`);
+    }
+    delete user.plainTextNotice;
+    changed = true;
+  }
+  if (changed) writeUsers(users);
+}
+
+function normalizeEmail(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function isValidEmail(email) {
+  return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[character]);
+}
+
+async function sendRegistrationEmail(teacher, invitationToken) {
+  const user = (process.env.GMAIL_USER || '').trim();
+  const pass = (process.env.GMAIL_APP_PASSWORD || '').trim();
+  const baseUrl = (process.env.APP_URL || (process.env.NODE_ENV === 'production' ? '' : `http://localhost:${PORT}`)).trim();
+  let loginUrl;
+  try {
+    loginUrl = new URL(baseUrl);
+    if (!['http:', 'https:'].includes(loginUrl.protocol) || loginUrl.username || loginUrl.password ||
+        (process.env.NODE_ENV === 'production' && loginUrl.protocol !== 'https:')) return 'not_configured';
+    loginUrl.hash = `invite=${invitationToken}`;
+  } catch {
+    return 'not_configured';
+  }
+  if (!user || !pass) return 'not_configured';
+
+  const transport = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user, pass },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000
+  });
+
+  try {
+    const safeName = escapeHtml(teacher.name);
+    const safeEmail = escapeHtml(teacher.email);
+    const safeUrl = escapeHtml(loginUrl.href);
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Cambridge Assessment account</title></head>
+<body style="margin:0;padding:0;background-color:#f1f6ed;font-family:Arial,Helvetica,sans-serif;color:#243527;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f1f6ed;">
+    <tr><td align="center" style="padding:32px 16px;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background-color:#ffffff;border:1px solid #dfebd7;border-radius:16px;overflow:hidden;">
+        <tr><td style="background-color:#3a6b28;padding:28px 32px;color:#ffffff;">
+          <table role="presentation" cellspacing="0" cellpadding="0" style="background-color:#ffffff;border-radius:8px;">
+            <tr><td style="padding:10px 14px;"><img src="cid:cambridge-assessment-logo" width="270" alt="Cambridge Assessment International Education" style="display:block;width:270px;max-width:100%;height:auto;border:0;"></td></tr>
+          </table>
+          <p style="margin:12px 0 0;color:#d4ebc8;font-size:11px;font-weight:700;letter-spacing:1.6px;text-transform:uppercase;">Paper Repository</p>
+        </td></tr>
+        <tr><td style="padding:32px;">
+          <p style="margin:0 0 10px;color:#5da440;font-size:11px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;">Your account is ready</p>
+          <h1 style="margin:0 0 18px;color:#243527;font-size:26px;line-height:1.2;">Welcome, ${safeName}</h1>
+          <p style="margin:0 0 22px;color:#506252;font-size:15px;line-height:1.65;">Your Cambridge Assessment Paper Repository account has been created. Use the private link below to sign in and set your password.</p>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f4f9f0;border:1px solid #d6e8cb;border-radius:10px;">
+            <tr><td style="padding:19px 20px;">
+              <p style="margin:0 0 6px;color:#61765f;font-size:11px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;">Email address</p>
+              <p style="margin:0 0 16px;color:#243527;font-size:15px;word-break:break-all;">${safeEmail}</p>
+              <p style="margin:0 0 6px;color:#61765f;font-size:11px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;">Temporary password</p>
+              <p style="margin:0;color:#2a4e1d;font-size:22px;font-weight:700;letter-spacing:2px;">123</p>
+            </td></tr>
+          </table>
+          <p style="margin:24px 0;"><a href="${safeUrl}" style="display:inline-block;background-color:#4a8833;color:#ffffff;text-decoration:none;font-size:14px;font-weight:700;padding:14px 23px;border-radius:8px;">Sign in &amp; set password</a></p>
+          <p style="margin:0;color:#506252;font-size:14px;line-height:1.6;">On your first sign-in, you must change your temporary password.</p>
+        </td></tr>
+        <tr><td style="background-color:#f8fbf6;border-top:1px solid #e3eddd;padding:20px 32px;color:#71836d;font-size:12px;line-height:1.5;">
+          Cambridge Assessment &bull; Paper Repository<br>Need help? Contact your administrator.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+    await transport.sendMail({
+      from: { name: 'Cambridge Assessment', address: user },
+      to: teacher.email,
+      subject: 'Welcome to Cambridge Assessment Paper Repository',
+      text: `Hello ${teacher.name},\n\nYour Cambridge Assessment Paper Repository account has been created.\n\nEmail address: ${teacher.email}\nTemporary password: 123\n\nTo sign in and set your password, view this email in an app that displays the sign-in button. You must choose a new password when you first sign in.\n\nCambridge Assessment Paper Repository`,
+      html,
+      attachments: [{
+        filename: 'cambridge-assessment.png',
+        path: path.join(__dirname, 'public', 'images', 'cambridge-email-logo.png'),
+        cid: 'cambridge-assessment-logo',
+        contentDisposition: 'inline'
+      }]
+    });
+    return 'sent';
+  } catch (err) {
+    console.error('Registration email could not be sent:', err.code || 'MAIL_ERROR');
+    return 'failed';
+  } finally {
+    transport.close();
+  }
+}
+
+const passwordEncryptionKey = loadPasswordEncryptionKey();
 
 // Ensure default users if empty
 if (!fs.existsSync(USERS_FILE)) {
   if (process.env.NODE_ENV === 'production') {
     const adminUsername = (process.env.ADMIN_USERNAME || 'admin').trim().toLowerCase();
+    const adminEmail = normalizeEmail(process.env.ADMIN_EMAIL);
     const adminPassword = (process.env.ADMIN_PASSWORD || '').trim();
 
-    if (!adminPassword) {
-      console.error('ADMIN_PASSWORD is required for the first production start.');
-      console.error('Set ADMIN_PASSWORD (and optionally ADMIN_USERNAME / ADMIN_NAME) and restart.');
+    if (!isValidEmail(adminEmail) || adminPassword.length < 8) {
+      console.error('A valid ADMIN_EMAIL and an ADMIN_PASSWORD of at least 8 characters are required for the first production start.');
       process.exit(1);
     }
 
     const productionAdmin = [{
       id: 'admin-1',
       username: adminUsername,
+      email: adminEmail,
       passwordHash: hashPassword(adminPassword),
-      plainTextNotice: adminPassword,
       role: 'admin',
       name: (process.env.ADMIN_NAME || 'Administrator').trim(),
       assignedSubjects: ['Biology', 'Chemistry'],
@@ -64,8 +297,8 @@ if (!fs.existsSync(USERS_FILE)) {
       {
         id: 'admin-1',
         username: 'admin',
+        email: 'admin@example.test',
         passwordHash: hashPassword('admin123'),
-        plainTextNotice: 'admin123',
         role: 'admin',
         name: 'Head of Science / Admin',
         assignedSubjects: ['Biology', 'Chemistry'],
@@ -74,8 +307,9 @@ if (!fs.existsSync(USERS_FILE)) {
       {
         id: 'teacher-bio-1',
         username: 'bio_teacher',
+        email: 'biology@example.test',
         passwordHash: hashPassword('teacher123'),
-        plainTextNotice: 'teacher123',
+        encryptedPassword: encryptTeacherPassword('teacher123', 'teacher-bio-1'),
         role: 'teacher',
         name: 'Sarah Jenkins (Biology)',
         assignedSubjects: ['Biology'],
@@ -84,8 +318,9 @@ if (!fs.existsSync(USERS_FILE)) {
       {
         id: 'teacher-chem-1',
         username: 'chem_teacher',
+        email: 'chemistry@example.test',
         passwordHash: hashPassword('teacher123'),
-        plainTextNotice: 'teacher123',
+        encryptedPassword: encryptTeacherPassword('teacher123', 'teacher-chem-1'),
         role: 'teacher',
         name: 'David Alistair (Chemistry)',
         assignedSubjects: ['Chemistry'],
@@ -94,8 +329,8 @@ if (!fs.existsSync(USERS_FILE)) {
       {
         id: 'student-1',
         username: 'student',
+        email: 'student@example.test',
         passwordHash: hashPassword('student123'),
-        plainTextNotice: 'student123',
         role: 'student',
         name: 'Student Member',
         assignedSubjects: ['Biology', 'Chemistry'],
@@ -105,6 +340,8 @@ if (!fs.existsSync(USERS_FILE)) {
     fs.writeFileSync(USERS_FILE, JSON.stringify(defaultUsers, null, 2), 'utf8');
   }
 }
+
+migratePasswords();
 
 // In-memory active sessions token -> user
 const sessions = new Map();
@@ -123,7 +360,8 @@ function readData(filePath, defaultVal = []) {
 
 function writeData(filePath, data) {
   try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+    if (filePath === USERS_FILE) writeUsers(data);
+    else fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
     return true;
   } catch (err) {
     console.error(`Error writing ${filePath}:`, err);
@@ -143,6 +381,14 @@ function authMiddleware(req, res, next) {
 
   if (!user) {
     return res.status(401).json({ error: 'Session expired or invalid. Please login again.' });
+  }
+
+  const passwordChangeRoute =
+    (req.method === 'GET' && req.path === '/api/auth/me') ||
+    (req.method === 'PUT' && req.path === '/api/auth/password') ||
+    (req.method === 'POST' && req.path === '/api/auth/logout');
+  if (user.mustChangePassword && !passwordChangeRoute) {
+    return res.status(403).json({ error: 'You must change your temporary password first.' });
   }
 
   req.user = user;
@@ -195,31 +441,49 @@ function readClasses() {
 // ==================== AUTH ROUTES ====================
 
 app.post('/api/auth/login', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
+  const email = normalizeEmail(req.body.email);
+  const { password, invitationToken } = req.body;
+  if (!isValidEmail(email) || typeof password !== 'string' || !password.trim()) {
+    return res.status(400).json({ error: 'A valid email and password are required' });
   }
 
   const users = readData(USERS_FILE, []);
-  const inputHash = hashPassword(password);
-
-  const matched = users.find(u => 
-    u.username.toLowerCase() === username.trim().toLowerCase() &&
-    (u.passwordHash === inputHash || u.plainTextNotice === password.trim())
+  const matchingUsers = users.filter(u => normalizeEmail(u.email) === email);
+  const matched = matchingUsers.length === 1 ? matchingUsers[0] : null;
+  const invalidCredentials = !matched || (!verifyPassword(password, matched.passwordHash) &&
+    !verifyPassword(password, matched.alternatePasswordHash));
+  const invalidInvitation = matched && matched.mustChangePassword && (
+    typeof invitationToken !== 'string' || !/^[a-f0-9]{64}$/.test(invitationToken) ||
+    !matched.invitationTokenHash || hashToken(invitationToken) !== matched.invitationTokenHash
   );
 
-  if (!matched) {
-    return res.status(401).json({ error: 'Invalid username or password' });
+  if (invalidCredentials || invalidInvitation) {
+    return res.status(401).json({ error: 'Invalid email, password, or invitation link.' });
+  }
+
+  let securityUpdate = false;
+  if (matched.passwordHash.startsWith('scrypt-sha256$') || matched.alternatePasswordHash) {
+    matched.passwordHash = hashPassword(password);
+    delete matched.alternatePasswordHash;
+    securityUpdate = true;
+  }
+  if (matched.role === 'teacher' && (!matched.encryptedPassword || securityUpdate)) {
+    matched.encryptedPassword = encryptTeacherPassword(password, matched.id);
+    securityUpdate = true;
+  }
+  if (securityUpdate && !writeData(USERS_FILE, users)) {
+    return res.status(500).json({ error: 'Could not update account security.' });
   }
 
   const token = crypto.randomBytes(32).toString('hex');
   const userSession = {
     id: matched.id,
     username: matched.username,
+    email: normalizeEmail(matched.email),
     name: matched.name,
     role: matched.role,
     assignedSubjects: matched.assignedSubjects || (matched.role === 'admin' ? ['Biology', 'Chemistry'] : ['Biology']),
-    plainTextNotice: matched.plainTextNotice || ''
+    mustChangePassword: Boolean(matched.mustChangePassword)
   };
 
   sessions.set(token, userSession);
@@ -238,8 +502,9 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
   if (fresh) {
     req.user.assignedSubjects = fresh.assignedSubjects || [];
     req.user.name = fresh.name;
+    req.user.email = normalizeEmail(fresh.email);
     req.user.role = fresh.role;
-    req.user.plainTextNotice = fresh.plainTextNotice || '';
+    req.user.mustChangePassword = Boolean(fresh.mustChangePassword);
   }
   res.json({ user: req.user });
 });
@@ -248,37 +513,42 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
 app.put('/api/auth/password', authMiddleware, (req, res) => {
   const { currentPassword, newPassword } = req.body;
 
-  if (!currentPassword || !newPassword) {
+  if (typeof currentPassword !== 'string' || typeof newPassword !== 'string' || !currentPassword.trim() || !newPassword.trim()) {
     return res.status(400).json({ error: 'Current and new password are required.' });
   }
 
-  const cleanNew = String(newPassword).trim();
-  if (cleanNew.length < 3) {
-    return res.status(400).json({ error: 'New password must be at least 3 characters.' });
-  }
-
+  const cleanNew = newPassword.trim();
   const users = readData(USERS_FILE, []);
   const user = users.find(u => u.id === req.user.id);
   if (!user) {
     return res.status(404).json({ error: 'User not found.' });
   }
 
-  const currentMatches =
-    user.passwordHash === hashPassword(currentPassword) ||
-    user.plainTextNotice === String(currentPassword).trim();
+  const firstChange = Boolean(user.mustChangePassword);
+  if (cleanNew.length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+  }
+  if (firstChange && cleanNew === currentPassword.trim()) {
+    return res.status(400).json({ error: 'Choose a different password from your temporary password.' });
+  }
 
-  if (!currentMatches) {
+  if (!verifyPassword(currentPassword, user.passwordHash)) {
     return res.status(400).json({ error: 'Current password is incorrect.' });
   }
 
   user.passwordHash = hashPassword(cleanNew);
-  user.plainTextNotice = cleanNew;
-  writeData(USERS_FILE, users);
+  if (user.role === 'teacher') user.encryptedPassword = encryptTeacherPassword(cleanNew, user.id);
+  delete user.alternatePasswordHash;
+  user.mustChangePassword = false;
+  delete user.invitationTokenHash;
+  if (!writeData(USERS_FILE, users)) {
+    return res.status(500).json({ error: 'Could not save your new password.' });
+  }
 
-  // Keep every active session for this user in sync
-  for (const sess of sessions.values()) {
+  for (const [token, sess] of sessions.entries()) {
     if (sess.id === user.id) {
-      sess.plainTextNotice = user.plainTextNotice;
+      if (sess !== req.user) sessions.delete(token);
+      else sess.mustChangePassword = false;
     }
   }
 
@@ -344,7 +614,7 @@ app.get('/api/admin/teachers', authMiddleware, adminMiddleware, (req, res) => {
       phone: u.phone || '',
       role: u.role,
       assignedSubjects: u.assignedSubjects || [],
-      plainTextNotice: u.plainTextNotice || '123',
+      mustChangePassword: Boolean(u.mustChangePassword),
       createdAt: u.createdAt,
       papersCount: papers.filter(p => p.uploadedByUsername === u.username || p.uploadedBy === u.name).length
     }));
@@ -363,7 +633,14 @@ app.get('/api/admin/teachers/:id/details', authMiddleware, adminMiddleware, (req
   }
 
   const teacherPapers = papers.filter(p => p.uploadedByUsername === teacher.username || p.uploadedBy === teacher.name);
+  let password = null;
+  try {
+    if (teacher.encryptedPassword) password = decryptTeacherPassword(teacher.encryptedPassword, teacher.id);
+  } catch {
+    return res.status(500).json({ error: 'Could not decrypt the teacher password. Check the encryption key.' });
+  }
 
+  res.set('Cache-Control', 'no-store');
   res.json({
     teacher: {
       id: teacher.id,
@@ -373,7 +650,7 @@ app.get('/api/admin/teachers/:id/details', authMiddleware, adminMiddleware, (req
       phone: teacher.phone || '',
       role: teacher.role,
       assignedSubjects: teacher.assignedSubjects || [],
-      plainTextNotice: teacher.plainTextNotice || '123',
+      password,
       createdAt: teacher.createdAt
     },
     papers: teacherPapers
@@ -381,24 +658,21 @@ app.get('/api/admin/teachers/:id/details', authMiddleware, adminMiddleware, (req
 });
 
 // Add new teacher with subject permissions (Default password: 123)
-app.post('/api/admin/teachers', authMiddleware, adminMiddleware, (req, res) => {
-  const { username, password, name, assignedSubjects, email, phone } = req.body;
+app.post('/api/admin/teachers', authMiddleware, adminMiddleware, async (req, res) => {
+  const { username, name, assignedSubjects, email, phone } = req.body;
 
   if (!username || !name) {
     return res.status(400).json({ error: 'Username and full name are required.' });
   }
 
-  const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  const cleanEmail = normalizeEmail(email);
   const cleanPhone = typeof phone === 'string' ? phone.trim() : '';
-  if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+  if (!isValidEmail(cleanEmail)) {
     return res.status(400).json({ error: 'Please enter a valid email address.' });
   }
   if (cleanPhone && !/^[+()\d\s-]{7,20}$/.test(cleanPhone)) {
     return res.status(400).json({ error: 'Please enter a valid phone number.' });
   }
-
-  // Default password to 123 if omitted
-  const finalPassword = (password && password.trim().length > 0) ? password.trim() : '123';
 
   if (!assignedSubjects || !Array.isArray(assignedSubjects) || assignedSubjects.length === 0) {
     return res.status(400).json({ error: 'Please assign at least one subject (Biology, Chemistry, or both).' });
@@ -413,17 +687,25 @@ app.post('/api/admin/teachers', authMiddleware, adminMiddleware, (req, res) => {
 
   const users = readData(USERS_FILE, []);
 
+  if (users.some(u => normalizeEmail(u.email) === cleanEmail)) {
+    return res.status(400).json({ error: 'This email address is already in use.' });
+  }
+
   // Check unique username
   const exists = users.some(u => u.username.toLowerCase() === username.trim().toLowerCase());
   if (exists) {
     return res.status(400).json({ error: `Username "${username}" already exists. Please pick another.` });
   }
 
+  const invitationToken = crypto.randomBytes(32).toString('hex');
+  const teacherId = 'teacher-' + crypto.randomUUID();
   const newTeacher = {
-    id: 'teacher-' + crypto.randomUUID(),
+    id: teacherId,
     username: username.trim().toLowerCase(),
-    passwordHash: hashPassword(finalPassword),
-    plainTextNotice: finalPassword,
+    passwordHash: hashPassword('123'),
+    encryptedPassword: encryptTeacherPassword('123', teacherId),
+    mustChangePassword: true,
+    invitationTokenHash: hashToken(invitationToken),
     role: 'teacher',
     name: name.trim(),
     email: cleanEmail,
@@ -433,10 +715,20 @@ app.post('/api/admin/teachers', authMiddleware, adminMiddleware, (req, res) => {
   };
 
   users.push(newTeacher);
-  writeData(USERS_FILE, users);
+  if (!writeData(USERS_FILE, users)) {
+    return res.status(500).json({ error: 'Could not save the teacher account.' });
+  }
+
+  const notificationStatus = await sendRegistrationEmail(newTeacher, invitationToken);
+  const message = notificationStatus === 'sent'
+    ? (!process.env.APP_URL ? 'Invitation sent. The local login link only works on this computer.' : 'Teacher registered and invitation sent.')
+    : notificationStatus === 'not_configured'
+      ? 'Teacher registered, but Gmail or the secure login link is not configured. Resend the invitation after configuration.'
+      : 'Teacher registered, but the invitation could not be sent. Please resend it.';
 
   res.status(201).json({
-    message: 'Teacher registered successfully! Default password is 123.',
+    message,
+    notificationStatus,
     teacher: {
       id: newTeacher.id,
       username: newTeacher.username,
@@ -445,11 +737,32 @@ app.post('/api/admin/teachers', authMiddleware, adminMiddleware, (req, res) => {
       phone: newTeacher.phone,
       role: newTeacher.role,
       assignedSubjects: newTeacher.assignedSubjects,
-      plainTextNotice: newTeacher.plainTextNotice,
       createdAt: newTeacher.createdAt,
       papersCount: 0
     }
   });
+});
+
+app.post('/api/admin/teachers/:id/invitation', authMiddleware, adminMiddleware, async (req, res) => {
+  const users = readData(USERS_FILE, []);
+  const teacher = users.find(u => u.id === req.params.id && u.role === 'teacher');
+  if (!teacher) return res.status(404).json({ error: 'Teacher not found.' });
+  if (!teacher.mustChangePassword) return res.status(400).json({ error: 'This teacher has already set a password.' });
+
+  const invitationToken = crypto.randomBytes(32).toString('hex');
+  teacher.invitationTokenHash = hashToken(invitationToken);
+  if (!writeData(USERS_FILE, users)) return res.status(500).json({ error: 'Could not save the invitation.' });
+  for (const [token, session] of sessions.entries()) {
+    if (session.id === teacher.id) sessions.delete(token);
+  }
+
+  const notificationStatus = await sendRegistrationEmail(teacher, invitationToken);
+  const message = notificationStatus === 'sent'
+    ? (!process.env.APP_URL ? 'Invitation sent. The local login link only works on this computer.' : 'Invitation sent.')
+    : notificationStatus === 'not_configured'
+      ? 'Gmail or the secure login link is not configured; the invitation was not sent.'
+      : 'The invitation could not be sent.';
+  res.json({ notificationStatus, message });
 });
 
 // Update teacher (subjects, name, username, password)
@@ -466,10 +779,18 @@ app.put('/api/admin/teachers/:id', authMiddleware, adminMiddleware, (req, res) =
 
   if (name && name.trim()) teacher.name = name.trim();
 
+  let invitationNeedsResending = false;
   if (email !== undefined) {
-    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+    const cleanEmail = normalizeEmail(email);
+    if (!isValidEmail(cleanEmail)) {
       return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    if (users.some(u => u.id !== id && normalizeEmail(u.email) === cleanEmail)) {
+      return res.status(400).json({ error: 'This email address is already in use.' });
+    }
+    if (teacher.mustChangePassword && cleanEmail !== normalizeEmail(teacher.email)) {
+      delete teacher.invitationTokenHash;
+      invitationNeedsResending = true;
     }
     teacher.email = cleanEmail;
   }
@@ -494,33 +815,46 @@ app.put('/api/admin/teachers/:id', authMiddleware, adminMiddleware, (req, res) =
     teacher.assignedSubjects = assignedSubjects;
   }
 
-  if (password && password.trim().length > 0) {
+  const resettingPassword = password !== undefined && password !== '';
+  if (resettingPassword) {
+    if (typeof password !== 'string' || password.trim().length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+    }
+    if (teacher.mustChangePassword) {
+      return res.status(400).json({ error: 'The teacher must set their password using the invitation first.' });
+    }
     teacher.passwordHash = hashPassword(password);
-    teacher.plainTextNotice = password.trim();
+    teacher.encryptedPassword = encryptTeacherPassword(password, teacher.id);
+    delete teacher.alternatePasswordHash;
   }
 
-  writeData(USERS_FILE, users);
+  if (!writeData(USERS_FILE, users)) {
+    return res.status(500).json({ error: 'Could not save the teacher account.' });
+  }
 
   // Update in-memory sessions if teacher is currently logged in
   for (let [tok, sess] of sessions.entries()) {
     if (sess.id === id) {
-      sess.name = teacher.name;
-      sess.username = teacher.username;
-      sess.assignedSubjects = teacher.assignedSubjects;
-      sess.plainTextNotice = teacher.plainTextNotice || '';
+      if (invitationNeedsResending || resettingPassword) {
+        sessions.delete(tok);
+      } else {
+        sess.name = teacher.name;
+        sess.username = teacher.username;
+        sess.email = normalizeEmail(teacher.email);
+        sess.assignedSubjects = teacher.assignedSubjects;
+      }
     }
   }
 
   res.json({
-    message: 'Teacher details updated successfully.',
+    message: invitationNeedsResending ? 'Teacher updated. Resend the invitation to the new email address.' : 'Teacher details updated successfully.',
     teacher: {
       id: teacher.id,
       username: teacher.username,
       name: teacher.name,
       email: teacher.email || '',
       phone: teacher.phone || '',
-      assignedSubjects: teacher.assignedSubjects,
-      plainTextNotice: teacher.plainTextNotice
+      assignedSubjects: teacher.assignedSubjects
     }
   });
 });
@@ -935,7 +1269,21 @@ app.get('/api/admin/deletion-requests', authMiddleware, adminMiddleware, (req, r
     return {
       ...r,
       paperSubject: r.paperSubject || (paper && paper.subject),
-      requestedByName: r.requestedByName || (teacher && teacher.name)
+      requestedByName: r.requestedByName || (teacher && teacher.name),
+      paper: paper ? {
+        id: paper.id,
+        title: paper.title,
+        subject: paper.subject,
+        classYear: paper.classYear,
+        term: paper.term,
+        academicYear: paper.academicYear,
+        paperType: paper.paperType,
+        originalName: paper.originalName,
+        size: paper.size,
+        uploadedBy: paper.uploadedBy,
+        uploadedByUsername: paper.uploadedByUsername,
+        createdAt: paper.createdAt
+      } : null
     };
   }) });
 });
@@ -996,9 +1344,7 @@ app.listen(PORT, () => {
   console.log(`  URL: http://localhost:${PORT}                 `);
   console.log(`  Storage: ${DATA_DIR}`);
   if (process.env.NODE_ENV !== 'production') {
-    console.log(`  Admin Login: admin / admin123                 `);
-    console.log(`  Bio Teacher: bio_teacher / teacher123         `);
-    console.log(`  Chem Teacher: chem_teacher / teacher123       `);
+    console.log(`  New demo accounts use @example.test email addresses.`);
   } else {
     console.log(`  Mode: production                              `);
   }
